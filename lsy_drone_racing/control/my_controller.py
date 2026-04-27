@@ -26,22 +26,15 @@ class MyController(Controller):
         self.drone_mass = drone_params["mass"]
 
 
-        # In __init__: Use these balanced gains
-# 1. Softer P and D gains to prevent high-frequency shaking when inertia randomly drops
         self.kp = np.array([0.8, 0.8, 1.5])
         self.kd = np.array([0.4, 0.4, 0.6])
-        
-        # 2. Stronger I gain to quickly "learn" and adapt to the unknown random mass
         self.ki = np.array([0.25, 0.25, 0.4]) 
-        
-        # 3. Increase the ki_range (windup limit) so it is actually allowed 
-        # to push hard enough to carry the heaviest random mass spawns
         self.ki_range = np.array([4.0, 4.0, 2.5])
         self.i_error = np.zeros(3)
         self.g = 9.81
-        self._t_total = 12  # s
-        # --- DYNAMIC TRAJECTORY GENERATION ---
+        self._t_total = 10  # s
 
+        # --- DYNAMIC TRAJECTORY GENERATION ---
         self.nominal_gates = [np.array(g["pos"]) for g in config.env.track.gates]
         self.nominal_obstacles = [np.array(o["pos"]) for o in config.env.track.obstacles]
         
@@ -51,8 +44,6 @@ class MyController(Controller):
 
         self.spawn_pos = obs["pos"].copy()
 
-        
-
         # Generate initial trajectory guess
         self._update_trajectory(obs["pos"], self.nominal_gates, self.nominal_obstacles)
         
@@ -60,6 +51,7 @@ class MyController(Controller):
         self._finished = False
 
     def _update_trajectory(self, current_pos, target_gates, target_obstacles):
+
         R_DRONE = 0.10
         R_OBS = 0.03 / 2.0
         GATE_HALF_WIDTH = 0.4 / 2
@@ -94,7 +86,7 @@ class MyController(Controller):
                     detour_pos = obs_pos.copy()
                     detour_pos[2] = gate_pos[2] 
                     detour_pos += right_shift * SAFE_RADIUS 
-                    detour_pos -= direction * 0.25
+                    detour_pos -= direction * 0.2
                     waypoints_list.append(detour_pos)
                     break 
             
@@ -124,12 +116,12 @@ class MyController(Controller):
                             
             # Step 2: Calculate variable GATE_DEPTH
             if blocking_obs_dist is not None:
-                # Scale depth to 40% of the distance to the obstacle, 
+                # Scale depth to 50% of the distance to the obstacle, 
                 # but never less than 0.15m (to clear the gate frame)
-                GATE_DEPTH = max(0.15, blocking_obs_dist * 0.4)
+                GATE_DEPTH = min(0.2, blocking_obs_dist *0.5)
             else:
                 # If the track is clear, use a smooth 0.8m straight exit
-                GATE_DEPTH = 0.8 
+                GATE_DEPTH = 0.8
                 
             # Step 3: Create the waypoints
             phantom_pos = gate_pos + (direction * GATE_DEPTH)
@@ -147,6 +139,8 @@ class MyController(Controller):
                 post_dodge_pos = closest_obs_pos.copy()
                 post_dodge_pos[2] = gate_pos[2]
                 post_dodge_pos += shift_dir * (SAFE_RADIUS * 2.5)
+
+                post_dodge_pos += direction * 0.4
             
             # Append waypoints
             phantom_pos[2] = gate_pos[2]
@@ -173,17 +167,6 @@ class MyController(Controller):
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
-        """Compute the next desired collective thrust and roll/pitch/yaw of the drone.
-
-        Args:
-            obs: The current observation of the environment. See the environment's observation space
-                for details.
-            info: Optional additional information as a dictionary.
-
-        Returns:
-            The orientation as roll, pitch, yaw angles, and the collective thrust
-            [r_des, p_des, y_des, t_des] as a numpy array.
-        """
         
         visited_mask_gates = obs["gates_visited"]
         newly_discovered_gates = visited_mask_gates & ~self.gates_discovered
@@ -192,7 +175,6 @@ class MyController(Controller):
         newly_discovered_obstacles = visited_mask_obstacles & ~self.obstacles_discovered
 
         if np.any(newly_discovered_gates) or np.any(newly_discovered_obstacles):
-            # We found the true position of a gate! 
             # Update our known gate array with the true positions from obs
             current_known_gates = []
             for i in range(len(self.nominal_gates)):
@@ -213,7 +195,6 @@ class MyController(Controller):
             self.gates_discovered = visited_mask_gates.copy()
             self.obstacles_discovered = visited_mask_obstacles.copy()
 
-        # 2. Proceed with your normal Attitude PID control using the updated spline
         t = min(self._tick / self._freq, self._t_total)
         
         if t >= self._t_total:  # Maximum duration reached
@@ -237,7 +218,6 @@ class MyController(Controller):
         target_thrust += self.ki * self.i_error
         target_thrust += self.kd * vel_error
         target_thrust[2] += self.drone_mass * self.g
-
 
         # Update z_axis to the current orientation of the drone
         z_axis = R.from_quat(obs["quat"]).as_matrix()[:, 2]
