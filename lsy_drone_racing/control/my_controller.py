@@ -1,3 +1,4 @@
+"""Module for the custom drone controller."""
 from __future__ import annotations  # Python 3.10 type hints
 
 import math
@@ -5,20 +6,19 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from drone_models.core import load_params
-from scipy.interpolate import CubicSpline
-from scipy.interpolate import PchipInterpolator
-from scipy.spatial.transform import Rotation as R
-
 from lsy_drone_racing.control import Controller
+from scipy.interpolate import CubicSpline
+from scipy.spatial.transform import Rotation as R
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
 class MyController(Controller):
-    
+    """A custom controller for drone racing."""
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+        """Initialize the controller."""
         super().__init__(obs, info, config)
         self._freq = config.env.freq
 
@@ -50,8 +50,13 @@ class MyController(Controller):
         self._tick = 0
         self._finished = False
 
-    def _update_trajectory(self, current_pos, target_gates, target_obstacles):
-
+    def _update_trajectory(
+        self,
+        current_pos: NDArray[np.floating],
+        target_gates: list[NDArray[np.floating]],
+        target_obstacles: list[NDArray[np.floating]],
+    ):
+        """Update the drone's trajectory based on known gates and obstacles."""
         R_DRONE = 0.10
         R_OBS = 0.03 / 2.0
         GATE_HALF_WIDTH = 0.4 / 2
@@ -129,7 +134,10 @@ class MyController(Controller):
             
             if blocking_obs_dist is not None:
                 # Determine which way to shift
-                cross_p = direction[0]*(closest_obs_pos[1]-gate_pos[1]) - direction[1]*(closest_obs_pos[0]-gate_pos[0])
+                cross_p = (
+                    direction[0] * (closest_obs_pos[1] - gate_pos[1])
+                    - direction[1] * (closest_obs_pos[0] - gate_pos[0])
+                )
                 shift_dir = right_shift if cross_p > 0 else -right_shift
                 
                 # Stage 1: Shift the phantom position slightly to start the dodge
@@ -161,7 +169,6 @@ class MyController(Controller):
             t = np.linspace(0, self._t_total, len(waypoints))
 
         self._des_pos_spline = CubicSpline(t, waypoints)
-        #self._des_pos_spline = PchipInterpolator(t, waypoints, axis=0)
         self._des_vel_spline = self._des_pos_spline.derivative()
 
     def compute_control(
