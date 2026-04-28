@@ -19,3 +19,6 @@ c_generated_code/
 !.pixi/config.toml
 ros_ws/
 acados/
+config/level0.toml
+config/level1.toml
+config/level2.toml
