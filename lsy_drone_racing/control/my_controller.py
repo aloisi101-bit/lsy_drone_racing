@@ -33,7 +33,7 @@ class MyController(Controller):
         self.ki_range = np.array([4.0, 4.0, 2.5])
         self.i_error = np.zeros(3)
         self.g = 9.81
-        self._t_total = 10  # s
+        self._t_total = 8  # s
 
         # --- DYNAMIC TRAJECTORY GENERATION ---
         self.nominal_gates = [np.array(g["pos"]) for g in config.env.track.gates]
