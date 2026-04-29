@@ -6,9 +6,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from drone_models.core import load_params
-from lsy_drone_racing.control import Controller
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
+
+from lsy_drone_racing.control import Controller
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -174,7 +175,7 @@ class MyController(Controller):
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
-        
+        """Compute the control action for the drone based on current observations."""
         visited_mask_gates = obs["gates_visited"]
         newly_discovered_gates = visited_mask_gates & ~self.gates_discovered
 
