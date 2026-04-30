@@ -33,7 +33,7 @@ class MyController(Controller):
         self.ki_range = np.array([4.0, 4.0, 2.5])
         self.i_error = np.zeros(3)
         self.g = 9.81
-        self._t_total = 8  # s
+        self._t_total = 7.5  # s
 
         # --- DYNAMIC TRAJECTORY GENERATION ---
         self.nominal_gates = [np.array(g["pos"]) for g in config.env.track.gates]
@@ -69,7 +69,7 @@ class MyController(Controller):
         
         waypoints_list = [current_pos]
         takeoff_pos = current_pos.copy()
-        takeoff_pos[2] += 0.5
+        takeoff_pos[2] += 0.35
         waypoints_list.append(takeoff_pos)
         
         for i, gate_pos in enumerate(target_gates):
@@ -111,7 +111,7 @@ class MyController(Controller):
                 forward_dist = np.dot(obs_dir, direction[0:2])
                 
                 # Check if it is within 1.5m in front of us
-                if 0 < forward_dist < 1.5:
+                if 0 < forward_dist < 2.0:
                     lateral_dist = np.linalg.norm(obs_dir - forward_dist * direction[0:2])
                     
                     # If it is in our flight path
@@ -127,7 +127,7 @@ class MyController(Controller):
                 GATE_DEPTH = min(0.2, blocking_obs_dist *0.5)
             else:
                 # If the track is clear, use a smooth 0.8m straight exit
-                GATE_DEPTH = 0.8
+                GATE_DEPTH = 0.7
                 
             # Step 3: Create the waypoints
             phantom_pos = gate_pos + (direction * GATE_DEPTH)
@@ -148,7 +148,6 @@ class MyController(Controller):
                 post_dodge_pos = closest_obs_pos.copy()
                 post_dodge_pos[2] = gate_pos[2]
                 post_dodge_pos += shift_dir * (SAFE_RADIUS * 2.5)
-
                 post_dodge_pos += direction * 0.4
             
             # Append waypoints
