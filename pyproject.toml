@@ -73,6 +73,7 @@ cmake = "*"
 compilers = ">=1.9.0, <1.11.0"
 make = "*"
 openblas = ">=0.3.30,<0.4"
+fire = ">=0.7.1,<0.8"
 
 [tool.pixi.pypi-dependencies]
 lsy_drone_racing = { path = ".", editable = true }
