@@ -10,6 +10,7 @@ from jax import random, jit, vmap
 from jax.lax import scan
 from typing import TYPE_CHECKING
 from scipy.spatial.transform import Rotation as R
+jax.config.update("jax_enable_x64", True) # <--- ADD THIS LINE
 
 from lsy_drone_racing.control.controller import Controller
 from drone_models.core import load_params
@@ -153,15 +154,15 @@ class MPPIControllerJAX(Controller):
         self.rng_key = random.PRNGKey(42)
         
         # Parse Level 0 track gates
-        self.gates = jnp.array([g["pos"] for g in config.env.track.gates], dtype=jnp.float32)
+        self.gates = jnp.array([g["pos"] for g in config.env.track.gates], dtype=jnp.float64)
         self.gate_tolerance = 0.4
         
         self.episode_reset()
 
     def compute_control(self, obs: dict[str, NDArray[np.floating]], info: dict | None = None) -> NDArray[np.floating]:
         # 1. Construct State Array
-        current_pos = jnp.array(obs["pos"], dtype=jnp.float32)
-        current_vel = jnp.array(obs["vel"], dtype=jnp.float32)
+        current_pos = jnp.array(obs["pos"], dtype=jnp.float64)
+        current_vel = jnp.array(obs["vel"], dtype=jnp.float64)
         current_state = jnp.concatenate([current_pos, current_vel])
         
         # 2. Track Progress
