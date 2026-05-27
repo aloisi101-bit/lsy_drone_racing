@@ -1,0 +1,698 @@
+﻿IEEE ROBOTICS AND AUTOMATION LETTERS. PREPRINT VERSION. ACCEPTED JANUARY, 2026 1
+
+PA-MPPI: Perception-Aware Model Predictive Path
+Integral Control for Quadrotor Navigation in
+
+Unknown Environments
+Yifan Zhai, Rudolf Reiter, and Davide Scaramuzza
+
+Abstract—Quadrotor navigation in unknown environments is
+critical for practical missions such as search-and-rescue. Solving
+it requires addressing three key challenges: path-planning in
+non-convex free space due to obstacles, satisfying quadrotor-
+specific dynamics and objectives, and exploring unknown regions
+to expand the map. Recently, the Model Predictive Path Integral
+(MPPI) method has emerged as a promising solution that
+solves the first two challenges. By leveraging sampling-based
+optimization, it can effectively handle non-convex free space while
+directly optimizing over the full quadrotor dynamics, enabling the
+inclusion of quadrotor-specific costs such as energy consumption.
+However, MPPI has been limited to tracking control that only
+optimizes trajectories in a small neighbourhood around a refer-
+ence trajectory, as it lacks the ability to explore unknown regions
+and plan alternative paths when blocked by large obstacles. To
+solve this issue, we introduce Perception-Aware MPPI (PA-MPPI).
+Here, perception-awareness is characterized by planning and
+adapting the trajectory online based on perception objectives.
+Specifically, when the goal is occluded, PA-MPPI’s perception
+cost biases trajectories that can perceive unknown regions. This
+expands the mapped traversable space and increases the likeli-
+hood of finding alternative paths to the goal. Through hardware
+experiments, we demonstrate that PA-MPPI, running at 50Hz, Fig. 1: The Perception-Aware MPPI (PA-MPPI) controller navigating to the
+performs on par with the SOTA quadrotor navigation planner goal pose while avoiding obstacles in a previously unknown environment. The
+for unknown environments in our challenging test scenarios. In controller simultaneously controls the quadrotor at 50Hz and optimizes the
+addition, we demonstrate that PA-MPPI can be used as a safe perception objective based on an online-updated 3D map constructed from
+and robust action policy for navigation foundation models, which onboard observations.
+often provide goal poses that are not directly reachable.
+
+Supplementary Materials create non-convex free space, which complicates gradient-
+based optimization; (ii) quadrotor-specific dynamics and costs:
+
+ Video: https://youtu.be/DNUK2gUcVIM planned trajectories must satisfy dynamic feasibility while
+optimizing costs such as effort and energy; and (iii) mapping
+
+I. Introduction in unknown environments: since the environment must be
+
+ENABLING quadrotors to navigate to a goal in unknown mapped online using onboard perception, successful naviga-
+environments autonomously is critical for practical mis- tion must incorporate exploration and mapping of unknown
+
+sions such as search-and-rescue, infrastructure inspection, and regions to find a feasible path to the goal.
+exploration [1]–[3]. It is also relevant for the safe deployment A common approach is a hierarchical planner–controller
+of navigation foundation models, which provide navigation architecture [6]–[10], where a global planner computes tra-
+waypoints or goals in previously unseen environments [4], jectories subsequently tracked by a local controller. However,
+[5]. Achieving this capability requires addressing three key this separation often results in conservative, or dynamically
+challenges: (i) non-convex constraints: cluttered environments infeasible plans, as quadrotor models and related costs and
+
+constraints need to be approximated [11].
+Manuscript received: September 5, 2025; Revised December 6, 2025;
+
+Accepted January 25, 2026. This paper was recommended for publication by Model Predictive Path Integral (MPPI) control has recently
+Editor Soon-Jo Chung upon evaluation of the Associate Editor and Reviewers emerged as a promising alternative. By employing sampling-
+comments. based optimization, MPPI can navigate non-convex and non-
+
+This work was supported by the European Union’s Horizon Europe Re-
+search and Innovation Programme under grant agreement No. 101120732 smooth free space in the presence of obstacles while directly
+(AUTOASSESS) and the European Research Council (ERC) under grant optimizing control inputs on quadrotor-specific dynamics and
+agreement No. 864042 (AGILEFLIGHT). These authors are with the Robotics costs [12], [13]. However, MPPI has been largely confined
+and Perception Group, Department of Informatics, University of Zurich,
+Switzerland (https://rpg.ifi.uzh.ch). Contact: dzhai@ifi.uzh.ch to following reference trajectories, demonstrating only limited
+
+Digital Object Identifier (DOI): see top of this page. local optimization near the reference, as it lacks both global
+
+arXiv:2509.14978v3  [cs.RO]  13 Feb 2026
+
+
+
+2 IEEE ROBOTICS AND AUTOMATION LETTERS. PREPRINT VERSION. ACCEPTED JANUARY, 2026
+
+map awareness and the capability to explore unknown areas obstacles, and [1] shows a real-world implementation for
+and plan successful trajectories. Unmanned Areal Vehicles (UAVs). However, such derivative-
+
+In this work, we introduce the Perception-Aware Model Pre- based formulations typically rely on smooth functions,
+dictive Path Integral (PA-MPPI) controller, tightly integrated which can be difficult to obtain directly from raw depth
+with a perception and mapping module, to afford standard observations in complex, highly non-smooth environments.
+MPPI with the capability of navigating unknown environments To circumvent this, [23] generates a number of candidate
+without external references. This is achieved by extending reference trajectories, and assigns cost based on collision
+standard MPPI with perception awareness, characterized by and proximity to the goal. However, the optimization that
+adapting control inputs and trajectory optimization based on generates the candidates does not consider actuation limits,
+both current and future perception of the environment [2], [14], which requires additional checks and potentially multiple
+[15]. Using the current map of the environment, PA-MPPI iterations of relaxation and re-optimization.
+introduces a novel perception cost that evaluates sampled Beyond optimization-based approaches, learned depth-
+trajectories based on their potential to perceive unknown camera-based policies have shown sufficient navigation per-
+regions in the goal direction, thereby guiding the optimized formance when trained end-to-end from visual inputs. The
+trajectory to map unknown regions that lead to the goal. authors in [24] demonstrated high-speed flight in real-world
+
+We validate PA-MPPI in simulated and real-world experi- environments using policies trained in simulation. More re-
+ments, demonstrating that perception-awareness enables MPPI cently, vision transformer-based policies have been explored
+to navigate through complex, unknown environments with for end-to-end quadrotor obstacle avoidance using onboard
+performance comparable to SUPER [10], the current state- computation [25]. While such approaches improve the closed-
+of-the-art planner for safety-assured quadrotor navigation in loop cost disregarding collisions, they often lack the safety-
+unknown environments. relevant explicit constraint handling and adaptability to new
+
+Our contributions are threefold: environments provided by optimization-based methods.
+• Novel Perception-Aware MPPI Formulation: We pro- Perception-Aware Navigation. A growing number of works
+pose a cost function that exploits the current environment integrates perception objectives directly into planning and con-
+map to guide trajectory optimization toward frontiers that trol, either to acquire task-relevant information or to maintain
+help perceive unknown regions towards the goal, allowing estimation quality. Perception-aware Model Predictive Control
+MPPI to navigate without external references. (MPC) aligns the robot’s viewpoint with features to maxi-
+
+• Integrated Framework: We present an integrated frame- mize visibility during challenging maneuvers [2], [14], [26].
+work that tightly couples sensing, mapping, and a high- Information-theoretic surrogates such as Fisher Information
+performance MPPI implementation, running at 50Hz for Fields provide differentiable maps for actively choosing infor-
+real-time quadrotor control. mative viewpoints [27], [28]. In exploration and inspection,
+
+• Hardware-in-the-Loop Validation: Our experiments planners explicitly reason about localization uncertainty to
+show that PA-MPPI performs comparably to the current select safe, observable trajectories [3].
+SOTA planner, SUPER [10]. We further demonstrate The research direction of our work treat unobserved space
+that using PA-MPPI as the action policy enables robust as potentially blocked or even hazardous within partial maps,
+deployment of navigation foundation models. thus requiring its goal-targeted exploration [6], [17], [18]. The
+
+high-level planners in [17], [18] enforce perception aware-
+ness along an optimistic trajectory by monitoring potentially
+
+II. Related Work hazardous regions, while [6] plans to explore the frontier
+Obstacle Avoidance in Cluttered Environments. In clas- of unknown space via a Dijkstra graph-search. The current
+
+sical sense-think-act architectures, a high-level planner is state-of-the-art planner, SUPER [10], simultaneous plans a
+responsible for more complex objectives and generates a exploratory trajectory, guided by A* graph-search in both free
+safe trajectory, which is then passed to a fast lower-level and unknown space for exploration and high speed flight,
+controller [11], [16]. Often, planners operate in a discrete and a backup trajectory in known free space for emergency
+or low-dimensional control/state space, for example, using stops. As these ideas typically resort to a separate planner,
+graph search [6]–[8] or rapidly exploring random trees [9]. they motivate our use of perception-driven costs in a single
+However, with a reduced state or control space, trajectories are controller that rewards the line of sight to the goal and prevents
+suboptimal and conservative, and the hierarchical decomposi- motion into unknown regions, with a focus on highly cluttered
+tion introduces an interaction between the controller and the environments obtained from depth images.
+planner. In particular, the novel perception-awareness requires Algorithms for Model Predictive Control. In the follow-
+a cost associated with orientation that cannot be accounted for ing, the proposed perception-aware Model Predictive Path In-
+in classical higher-level planners, such as those in [11], [16]. tegral (MPPI) algorithm is motivated, which extends classical
+
+Optimization-based approaches often simultaneously MPPI [29] by a perception cost.
+plan safe trajectories and control the actuators. However, a) Derivative-based MPC.: When objectives and con-
+optimization-based motion planning in the presence of straints admit smooth approximations, derivative-based MPC
+obstacles is challenging due to the induced nonconvexity offers strong local convergence and tight constraint handling.
+and nonsmoothness [17]–[22]. The authors in [18], [20], Progressive smoothing and continuation strategies have been
+[21] propose efficient algorithms for ellipsoidal or cubic proposed to navigate nonconvex obstacle costs [21], con-
+
+
+
+ZHAI et al.: PERCEPTION-AWARE MPPI FOR QUADROTOR NAVIGATION IN UNKNOWN ENVIRONMENTS 3
+
+ceptually paralleling equal to annealing in sampling-based
+MPC [30]. A recent approach proposed an algorithm with
+an external active set solver for cluttered point-cloud ob-
+stacles [31], which achieves a feasible average but has an
+ample worst-case computation time. Still, in settings where,
+in addition to obstacles represented by raw depth maps, the
+cost functions are also highly nonsmooth, constructing reli-
+able differentiable surrogates remains challenging. Sampling
+methods showed superior performance in these settings [32]. Fig. 2: Illustration of the control stack. The perception and mapping module
+
+b) Sampling-based MPC.: Sampling-based MPC meth- has three parts: (1) a point cloud is generated from the rendered depth image
+and transformed to the world frame, (2) the ROG-Map [42] updates the
+
+ods, such as MPPI, optimize control sequences by Monte Carlo occupancy map with the new point cloud, and (3) the ROG-Map is converted
+rollouts instead of using local gradients, making them attrac- to a JAX array as input to PA-MPPI.
+tive for nonconvex, nonsmooth objectives and dynamics. The
+most straightforward but largely inefficient random shooting a policy. The resulting single shooting MPC optimization
+method purely randomizes actions [33]. The Cross Entropy problem is therefore
+Method (CEM) [34] iteratively refines a distribution toward ∑−1
+high-performing controls via an elite-only update and has been min ̄ (x ;p) + ℓ(x ,u ;p)
+
+u
+widely adopted as a trajectory optimizer and within model- =0 (1)
+based RL pipelines [35]. MPPI control [29], [36], [37] uses all with x0 = , x+1 =  (x ,u), 0 ≤  < ,
+samples via weighting to iteratively refine an trajectory [38]. where constraints are approximated in the value and cost
+MPPI has recently been pushed to demanding robot platforms, function. We denote the dependency of the cost function on
+including agile UAVs [12] and whole-body locomotion [30], external parameters, such as obstacle parameters or the goal
+[39]. However, these works rely on external references, such by p ∈ R . Unlike gradient-based algorithms for solving the
+as a reference quadrotor trajectory or quadruped walking gait MPC problem (1), which typically rely on first or second-
+joint position reference. PA-MPPI, on the other hand, enables order derivatives, MPPI uses Monte Carlo sampling-based
+reference-free navigation via the novel perception-aware cost. optimization. Despite the initial derivation of MPPI control
+
+for the stochastic system [29], [36], [37], it is often used for
+III. Preliminaries the deterministic counterpart (1), where noise is added as part
+
+of the optimization algorithm [41].
+A. Notation
+
+We introduce two reference frames:  , the fixed world IV. Methodology
+frame, whose -axis is gravity-aligned, and , the quadrotor A graphical overview of the integrated control stack is
+body frame, whose -axis aligns with the onboard camera’s shown in Fig. 2. As illustrated, PA-MPPI receives an oc-
+principal axis. In this paper, vectors and matrices are written cupancy grid from the perception module and optimizes a
+in bold, with matrices indicated by capital letters. Each vector trajectory as control sequences, which are directly executed
+carries a subscript specifying the frame in which it is expressed by the quadrotor. The proposed PA-MPPI algorithm utilizes
+and its endpoint. For instance, p ∈ R3 denotes the position a quadrotor dynamics model, as described in Sect. IV-A.
+of the body frame  relative to the world frame  , and R A detailed description of the MPPI formulation is given in
+denotes the rotation from frame  to  . We use y 
+
+1: 
+ ∈ R Sect. IV-B. The perception and mapping part, and the cost
+
+for the vectorization of vectors y1, . . . , y
+
+
+ , with y ∈ R . The definition are detailed in Sect. IV-C and IV-D, respectively.
+quaternion algebra is H and  ∈ H1 := { ∈ H | |∥∥ = 1}.
+
+A. Quadrotor Dynamics
+In addition to the quadrotor’s position p, we define orien-
+
+B. Model Predictive Control tation, and linear velocity in the world frame by q ∈ H1, and
+Given an environment, often formulated as a Markov de- v 3
+
+ ∈ R , respectively, and the quadrotor’s angular velocity
+cision process (MDP), with the states x ∈ R , controls u ∈ in the body frame by ω ∈ R3. The collective thrust and
+R , a stage cost  : R ×R → R∪{∞}, a discount factor , the corresponding thrust vector in the body frame are defined
+and a stochastic model  : R × R → Dist(R ), MPC as  = 1 + . . . + rot and c = 0 0 ⊤
+
+ , where  is
+provides a means to yield nearly optimal (sufficiently subopti- the thrust generated by the -th of rot motors. The quadrotor
+mal) controls by solving an approximated implicit version of mass is  and g is the gravity vector in the world frame.
+the MDP online, local at the current state x̂ ∈ R , cf. [40] Finally, the diagonal moment of inertia matrix is J ∈ R3×3,
+for details. MPC typically uses a simplified deterministic and the body torque is τ ∈ R3. The quadrotor dynamics can
+model  : R × R → R , possibly simplified stage then be expressed as
+cost ℓ : R × R → R and an approximation ̄ : R → R 
+of the optimal value function 
+
+ : R → R. Moreover, an p  
+open-loop trajectory u x =   
+
+0:−1 with open-loop states x 
+ ∈ R , q   v 
+
+actions    
+u ∈ R and horizon  is optimized, instead of v   1 · q 
+
+  =  2Λ() 
+
+ω   q
+−  . (2)
+1
+
+    ⊙ c/ + g
+J (τ 
+
+ − ω × J · ω)
+
+
+
+4 IEEE ROBOTICS AND AUTOMATION LETTERS. PREPRINT VERSION. ACCEPTED JANUARY, 2026
+
+The lowest-level flight controller tracks the zero-order hold updating the occupancy grid at 50Hz for a 5 × 5 × 2m grid
+PA-MPPI control ⊤
+
+u =  ω, . To ensure a feasible with a voxel resolution of 0.1m.
+total thrust and body rate at each timestep, we follow the
+single motor thrust clipping in [12], using the motor thrust D. Optimization Cost Definition
+limits to acquire clipped control input clip
+
+ , which is then used
+by PA-MPPI to simulate the dynamics (2) via forward Euler At each timestep  within the planning horizon ,  =
+
+integration. 0, ...,−1, the stage cost of (1) for the navigation task consists
+of the following terms:
+
+B. MPPI formulation
+ℓgoal = −goal · max(0.0,d0 − d)
+
+In the MPPI framework, at each timestep  ,  parallel
+trajectories of ℓ
+
+ steps are sampled by adding multivariate goal,−1 = −goal,−1 · max(0.0,d0 − d−1)
+Gaussian noise to the nominal control input unom ℓ 2
+
+act = ∥u∥2
+:+ . The  + ∥Δu∥ ,
+
+Δ
+
+perturbed control sequences 
+u + ,  = 1, ...,  , are then
+:  ℓ 2
+
+vel = exp(−vel · d) · ∥v 2
+ ∥
+
+rolled out from the quadrotor state x using the model (2). ℓprogress = −progress · ∥p, − p,+1∥
+Each sampled trajectory 
+
+x + is then evaluated by summing
+:  ℓ
+
+the per-step costs L  = +−1   collision = collision · 1{G(p )≠0} ,
+= ℓ(x ,u ) + ̄ ( 
+
+x ). The op-
+timized control sequence is calculated using the exponentially ℓperception = PoI · (1 − ⟨x̂, d̂goal⟩)2 · 1{ ∥dgoal ∥>thresh }
+weighted average based on the summed cost + occupied · 1{G(r (∗ ) )=1}
+
+∑ + unknown · 1{G(r (∗ ) )=−1}
+ exp (− L −Lmin )
+
+u:+−1 =  u + ,   =  ,
+: −1  and the quantities:
+
+=1 =1 exp (− L −Lmin
+ )
+
+dgoal
+where Lmin is the lowest summed cost out of the  rollouts, d = ∥p, − pgoal∥, d̂goal =
+and ∥ ,
+
+d
+ is the temperature parameter. A low  assigns higher goal∥
+
+weight to the best-performing rollout, while higher values x̂ = R · e1.
+assign more uniform weights to all rollouts [38]. The first The terminal value function is ̄ () =
+action of the averaged sequence is then executed, and the safe1{ ∥v
+optimization process repeats in the next time step.  ∥>v}∨∥ω ∥>ω , with bounds v and ω, and a
+
+large penalty safe to account for safe set (hovering).
+Recent works [12], [30], [43] have shown success in de- The stage costs have two distinct phases: when the goal is
+
+coupling the prediction time step size Δpred, and the control not within the direct line of sight of the quadrotor, as shown in
+step size Δctrl. With Δpred > Δctrl, the policy rollouts can Fig. 3a, to encourage exploration, the cost is ℓ = ℓgoal+ℓgoal,+
+predict over a longer real-time horizon for the same number ℓact+ℓcollision+ℓperception, with goal = 0.125 and goal,−1 = 10;
+of forward simulation steps, allowing optimization of actions when the goal is within the direct line of sight, as shown
+further into the future. Since the optimization loop executes in Fig. 3b, to quickly reach the goal and hover, the cost is
+the first action at control frequency and the actions in the ℓ = ℓgoal + ℓact + ℓcollision + ℓprogress + ℓvel, with goal = 5.0. The
+sequence are spaced by Δpred, to reuse the remaining actions goal cost ℓgoal encourages getting closer to the goal compared
+as unom for the next iteration, the control sequence is linearly to the starting position of the current horizon. For the last step
+interpolated and shifted by Δctrl, then down-sampled at Δpred. of the horizon  =  − 1, an additional cost ℓgoal,−1 is given
+
+While the terminal value ̄ function should in principle to weight the end position of the horizon more, similar to the
+resemble the optimal value function and account for a recursive intermediate point cost in [23]. This prevents greedy behavior
+feasible safe set, cf. [40], we only consider a simple terminal and allows the policy to detour and go around obstacles if
+hovering safe set with zero velocity and resort to a long enough that brings the policy closer to the goal in the end. The action
+planning horizon to diminish its influence on the open loop cost ℓact penalizes the magnitude and change in control inputs,
+cost. similar to the implementation in [12]. The velocity penalty
+
+ℓvel encourages the quadrotor to slow down near the goal, and
+C. Perception & Environment Mapping the progress cost ℓprogress encourages fast movement when a
+
+We use a depth sensor on the quadrotor to continuously straight line path to the goal is available.
+build a 3D map of the environment during navigation. From The collision cost ℓcollision is a binary value weighted by
+each depth image, we reproject a point cloud into the world a large constant collision. The indicator function 1{G(p )≠0}
+frame using the camera pose. The point clouds are then returns 1 if the quadrotor’s current position lies outside the
+inserted into a ROG-Map [42], which efficiently aggregates set of free voxels defined in Section IV-C. This large penalty
+all past observations into a 3D occupancy grid representation, enforces the quadrotor not only to avoid collisions with known
+in which each voxel has one of three states: occupied, free, or obstacles but also to refrain from entering unknown regions,
+unknown, with integer values {1, 0,−1} respectively. Formally, which is critical for ensuring safety when navigating in un-
+the 3D occupancy grid is defined as G ∈ {−1, 0, 1}×× . known environments.
+We denote by G(p) the operation that looks up the voxel The perception cost, ℓperception, consists of two compo-
+corresponding to position p and returns its value. The nents. The first, weighted by PoI, encourages alignment of
+mapping pipeline is capable of processing depth images and the quadrotor’s x-axis (coinciding with the depth camera’s
+
+
+
+ZHAI et al.: PERCEPTION-AWARE MPPI FOR QUADROTOR NAVIGATION IN UNKNOWN ENVIRONMENTS 5
+
+TABLE I: PA-MPPI parameters.
+
+MPPI param. Cost definition constants
+ 17,500 pos 2.5 vel 5.0
+ 15  1.0 unknown -4.0
+ 0.02 collision 15.0 occupied 2.0
+Δpred 0.1 s PoI 5.0  diag(0.01, 0.025, 0.025, 0.2)
+Δctrl 0.02 s thresh 0.5 Δ diag(0.02, 0.05, 0.05, 0.05)
+
+the PA-MPPI controller to exploit map information, allowing
+it to plan around obstacles and efficiently explore unknown
+space. For the implementation of ray tracing, we adopt the
+3D Digital Differential Analyzer (DDA) algorithm [44], which
+does not require a signed distance field representation of the
+environment. Due to the high computational cost, ray tracing
+
+(a) Given only one depth observation, there is no position in known free space
+that has a direct line of sight to the goal. Trajectories receive a reward for is performed at the last step,  =  − 1, of the open-loop
+exploring unknown regions (blue trajectories) or a penalty for facing obstacles trajectory.
+(red trajectories).
+
+V. Experiments
+To evaluate the performance of PA-MPPI without consid-
+
+ering the effect of other modules in the control loop, such as
+depth sensor noise or imperfect state estimation, we conduct
+simulated and hardware-in-the-loop (HIL) [45] experiments.
+In the HIL setting, we use a motion capture system to acquire
+the ground truth state of the quadrotor, and the Flightmare
+simulator [46] to render depth images in real time. The PA-
+MPPI controller is implemented in JAX and integrated into the
+Agilicious control framework [45], running on a laptop with
+an i7-13800H CPU with 64GB RAM and a NVIDIA A1000
+laptop GPU with 6GB VRAM. The quadrotor used has a mass
+
+(b) After moving to a new position while mapping the environment, of 0.21 kg and arm length  = 19.4 cm, with propeller radius
+there is a direct line of sight from the current position to the goal, and of 3.81 cm and a thrust to weight ratio of 6.8.
+the second-phase cost is active, encouraging the quadrotor to directly
+reach the goal, and the perception cost is not assigned anymore. Two sets of experiments are conducted. The first consists
+
+of navigating synthetic scenes of varying difficulty (Fig. 4)
+Fig. 3: A top-down visualization of the ray-tracing in perception cost calcu-
+lation, showing the occupied voxels (red), free voxels (green), and unknown to quantitatively evaluate the performance of PA-MPPI. Ro-
+voxels (blue), and sampled trajectories on which ray-tracing is performed. bustness of PA-MPPI is also investigated by injecting wind
+
+disturbances during navigation. The second consists of in-
+principal axis) with the direction of the goal position (point door navigation scenes from the Habitat Matterport dataset
+of interest), thereby maximizing the goal’s visibility within [47], using goal poses proposed by a navigation foundation
+the image frame [2], [14]. As the quadrotor approaches the model [4] to demonstrate an example usage of PA-MPPI as
+goal (distance below thresh), this term becomes inactive. The the action policy for a Vision-Language-Action (VLA) model
+last two terms in ℓperception represent two mutually exclusive in unknown environments. A list of PA-MPPI parameters are
+cases of the quadrotor position with respect to the mapped provided in Table I. As in our experiments, the weight of the
+region of the environment. We define a ray that starts from the terminal safe set safe barely had an influence, we set it to zero.
+quadrotor position p and ends at the goal position pgoal as: Synthetic Scene Experiment. To quantitatively evaluate the
+r() = p +  ·dgoal, 0 ≤  ≤ 1. Since p is constrained to performance of PA-MPPI, we design three scenes for naviga-
+the known free space due to the collision cost, there exists a tion. The first is a C-shaped wall of varying sizes, a challenging
+∗ such that the ray either exits the free space at an obstacle obstacle against greedy policies. The second is a hole in a wall,
+or unknown space, as shown in Fig. 3a. If r(∗) lies in an similar to manholes that quadrotors must navigate through
+occupied voxel, a cost occupied is assigned. If r(∗) falls in during ship inspections [48]. The third scene consists of four
+an unknown voxel, then it suggests an exploration frontier walls that the quadrotor must navigate past, which tests path-
+towards the goal is present, and a negative cost unknown is finding capabilities and precise control through narrow gaps
+given. When there is a direct line of sight from the current of 0.5m. The difficulty of each scene is parametrized by
+position to the goal, the second-phase cost is active, as there the size of the obstacles  (each difficulty tested 5 times)
+is no need for exploration, and no perception cost is assigned. or the diameter of the holes  (5 random locations, each
+As illustrated in Fig. 3, this ray-tracing term favors sampled tested 2 times), as shown in Fig. 4. We validate the sufficient
+trajectories that either explore unknown regions when the goal difficulty of the scenes by first showing that a gradient-based
+is blocked by obstacles (Fig. 3a) or move directly toward trajectory optimization algorithm, EGO-Planner [22], fails to
+the goal when possible, cf. Fig. 3b. This design enables solve the tasks at harder difficulties. As shown in Fig. 5,
+
+
+
+6 IEEE ROBOTICS AND AUTOMATION LETTERS. PREPRINT VERSION. ACCEPTED JANUARY, 2026
+
+(a)  = 0 s (b)  = 3.0 s (c)  = 5.6 s
+
+(a) C-wall ( = 3.0m) (b) Hole ( = 0.5m) Fig. 6: PA-MPPI trajectory (C-wall with  = 3.0m), total distance 5.7m.
+
+(a)  = 0 s (b)  = 1.8 s
+(c) 4-Wall ( = 1.5m)
+
+Fig. 4: Synthetic scenes for navigation experiments. The goal pose for each
+task is always 3m ahead of the initial pose, with three types of obstacles
+in between: a C-shaped wall (a), a wall with a hole (b), and four walls (c).
+The most challenging setting for each scene is illustrated here, with example
+successful trajectories depicted in blue.
+
+(c)  = 4.6 s (d)  = 6.7 s
+
+Fig. 7: PA-MPPI trajectory (4-Wall with  = 1.5m), total distance 6.3m
+
+(a)  = 0.5m (b)  = 2m (c)  = 2m
+
+Fig. 5: Although EGO-Planner [22] is able to optimize the trajectory to
+navigate past the C-shaped wall in the easy setting (a), it struggles to find
+a feasible trajectory in the harder settings (b)(c). Yellow/Green: A* obstacle (a) Duration 6.3 s, dist. 6.3m (b) Duration 7.6 s, dist. 5.5m
+avoidance proposals, Blue: planned trajectories.
+
+Fig. 8: SUPER trajectory samples in the C-wall and the 4-wall scene
+while EGO-Planner is able to successfully navigate past a
+small obstacle, the optimization fails to converge when the TABLE II: C-Shaped Wall Experiment Results.
+
+A* obstacle avoidance front-end deviates significantly from Obs.
+Size Dist. Time Avg. Energy
+
+the initial trajectories, resulting in huge feasibility costs that (m) (s) Vel. Consumption
+ (ms−1) (J)
+
+prevent the optimization from converging.
+SUPER 1.0m 3.57 ± 0.15 4.54 ± 0.51 0.79 ± 0.05 217.1 ± 25.3
+
+As EGO-Planner [22] and trajectory tracking MPPI [12] (sim) 2.0m 4.54 ± 0.12 4.72 ± 0.28 0.96 ± 0.03 225.0 ± 13.2
+cannot navigate around obstacles beyond the easiest settings, 3.0m 6.48 ± 0.92 6.00 ± 0.84 1.08 ± 0.03 286.8 ± 42.0
+
+we use SUPER [10], the state-of-the-art safety-assured MAV PA-MPPI 1.0m 3.56 ± 0.04 2.91 ± 0.04 1.22 ± 0.03 142.0 ± 2.0
+(sim) 2.0m 4.56 ± 0.07 4.20 ± 0.07 1.09 ± 0.01 202.6 ± 3.5
+
+navigation planner in unknown environments, as the baseline. 3.0m 5.87 ± 0.07 5.14 ± 0.22 1.14 ± 0.06 249.5 ± 9.5
+SUPER replans at 10Hz, and a geometric controller is imple- PA-MPPI 1.0m 3.61 ± 0.13 2.84 ± 0.05 1.27 ± 0.04 —
+
+(real) 2.0m 4.59 ± 0.10 4.09 ± 0.09 1.12 ± 0.02 —
+mented to track the trajectories. We tune SUPER’s parameter 3.0m 5.88 ± 0.11 5.13 ± 0.18 1.15 ± 0.06 —
+to be as fast as possible without collisions in our test scenes.
+
+The experiment results are summarized in Table II, III, IV.
+Guided by the perception cost, PA-MPPI moves to positions aggressively optimized for dynamic feasibility by penalizing
+that help navigate around obstacles and map the environment jerk, body rate, and collective thrust, resulting in a smoother
+towards the goal, successfully completing the tasks, as vi- but longer trajectory, as shown in Fig. 8a. In the 4-wall scene,
+sualized in Fig. 6 and 7. While both SUPER and PA-MPPI the trajectory adheres to the shortest path in distance suggested
+are able to complete the tasks with 100% success rate, PA- by the A* front end. However, compared to PA-MPPI’s trajec-
+MPPI consistently performs better in terms of total time and tory, the final trajectory requires significantly more rotational
+velocity of the trajectories, while having trajectory distances control effort, as A* is unaware of the quadrotor dynamics.
+on par with SUPER. For a qualitative comparison, we visualize On the other hand, PA-MPPI inherently samples dynamically
+two trajectories from SUPER in Fig. 8. For the C-wall scene, feasible trajectories, allowing it to prioritize trajectory quality
+although SUPER’s A* front-end proposed trajectories close in the sampling-based optimization. As a result, PA-MPPI’s
+to the obstacle wall, the subsequent trajectory optimization trajectories are faster and significantly more energy-efficient.
+
+
+
+ZHAI et al.: PERCEPTION-AWARE MPPI FOR QUADROTOR NAVIGATION IN UNKNOWN ENVIRONMENTS 7
+
+TABLE III: Hole in the Wall Experiment Results.
+
+Hole
+Diameter Dist. Time Avg. Energy
+
+(m) (s) Vel. Consumption
+ (ms−1) (J)
+
+SUPER 0.5m 3.77 ± 0.41 4.36 ± 0.44 0.87 ± 0.05 209.0 ± 21.8
+(sim) 1.0m 3.83 ± 0.79 4.26 ± 0.56 0.89 ± 0.08 203.4 ± 27.3
+
+PA-MPPI 0.5m 3.66 ± 0.40 3.23 ± 0.42 1.14 ± 0.07 155.7 ± 20.3
+(sim) 1.0m 3.44 ± 0.38 2.79 ± 0.35 1.24 ± 0.08 135.8 ± 17.1
+
+PA-MPPI 0.5m 3.71 ± 0.45 3.22 ± 0.65 1.17 ± 0.11 —
+(real) 1.0m 3.52 ± 0.37 2.67 ± 0.30 1.32 ± 0.10 —
+
+(a) NoMaD proposed traj. (b) PA-MPPI trajectory
+
+TABLE IV: 4-Wall Experiment Results.
+
+Obs.
+Size Dist. Time Avg. Energy
+
+(m) (s) Vel. Consumption
+ (ms−1) (J)
+
+SUPER 0.5m 3.42 ± 0.14 4.30 ± 0.14 0.79 ± 0.02 204.7 ± 6.1
+(sim) 1.0m 5.22 ± 0.60 6.53 ± 0.34 0.80 ± 0.08 313.8 ± 17.0
+
+1.5m 5.47 ± 1.25 7.57 ± 0.99 0.72 ± 0.07 364.3 ± 50.0
+
+PA-MPPI 0.5m 3.78 ± 0.20 3.12 ± 0.08 1.19 ± 0.05 155.1 ± 4.1 (c) NoMaD proposed traj. (d) PA-MPPI trajectory
+(sim) 1.0m 3.97 ± 0.12 4.52 ± 0.15 0.88 ± 0.03 216.7 ± 7.0
+
+1.5m 6.03 ± 0.33 5.78 ± 0.23 1.05 ± 0.07 281.7 ± 11.2 Fig. 10: Two Habitat scenes, with obstacles (walls, furniture, etc) overlaid in
+PA-MPPI 0.5m 3.69 ± 0.09 2.94 ± 0.13 1.26 ± 0.05 — red and NoMaD proposed trajectory in blue (a)(c), and visualization of the
+(real) 1.0m 3.95 ± 0.07 4.03 ± 0.10 0.98 ± 0.04 — PA-MPPI trajectory in the occupancy map (b)(d).
+
+1.5m 5.89 ± 0.32 6.75 ± 0.75 0.88 ± 0.10 —
+
+cluttered environments using PA-MPPI, making it a suitable
+action policy for navigation foundation models.
+
+VI. Discussion & Future Work
+Due to the limited FoV of the depth sensor, a good initial
+
+observation is crucial for successful navigation around large
+obstacles. For example, in the experiment shown in Fig. 6,
+
+Fig. 9: Success rate of PA-MPPI under wind disturbance the initial observation at  = 0 s is initialized by turning the
+quadrotor ±90◦ to observe free space outside the convex hull
+
+Robustness Study. To investigate the robustness of PA- of the C-shaped wall. However, this issue can be solved by
+MPPI, we conduct simulated test in the most challenging replacing the depth camera with LIDAR, which only requires
+setting of the three tasks while the quadrotor is subjected to modification to the mapping module. Additonally, we only
+external wind disturbances. The wind directions are randomly considered navigation tasks within a fixed 3D boundary. Future
+sampled in the -plane for each episode, with wind magni- work may take advantage of the local map sliding feature of the
+tudes of [1.0m s−1, 2.0m s−1, 3.0m s−1] with 10 test episodes ROG-Map to implement larger scale navigation. Finally, PA-
+each. The results are shown in Fig. 9. With low external MPPI’s planning horizon is constrained by available computa-
+wind speed, PA-MPPI retains a high success rate, while at tion, which fundamentally limits the complexity of navigation
+larger wind speeds, the controller cannot compensate for the scenes it can handle. This may be mitigated by using an
+disturbance, resulting in more episodes failing by colliding into appropriate terminal value function on the last position of the
+the obstacles or being blown into unknown areas, resulting in horizon. We leave this for future work to investigate.
+early terminations.
+
+PA-MPPI combined with Navigation Foundation Model. VII. Conclusion
+We validate the real-world applicability of the PA-MPPI This work presents a perception-aware MPPI controller that
+controller by using it as the action policy for a navigation integrates a novel perception-driven cost to enable reference-
+foundation model, NoMaD [4], which proposes trajectory free quadrotor navigation in partially known, cluttered en-
+waypoints. Since the inputs to NoMaD are only monocular vironments with MPPI. By exploiting the current map, the
+RGB images, the proposed waypoints are not guaranteed to be perception term steers trajectories toward informative frontiers
+feasible due to scale ambiguity. We use two scenes from the to explore the unknown regions and advance towards the
+Habitat Matterport dataset [47]. In the first scene, visualized goal. Simulated and real-world experiments demonstrate that
+in Fig. 10a, the NoMaD proposed trajectory attempts to enter its performance is comparable to that of the state-of-the-art
+the room but misses the door. PA-MPPI was able to explore navigation planner. We further demonstrate its potential as an
+and map unknown regions in this scene, navigate through the action policy for foundation models to navigate challenging
+door, and ultimately reach the goal position, as shown in Fig. environments. Future work will focus on extending PA-MPPI
+10b. In the second scene, visualized in Fig. 10c, the NoMaD to longer-horizon navigation and conducting an in-depth study
+trajectory starts close to a ping-pong table and goes directly of its path-planning limits and methods to mitigate them.
+through it. PA-MPPI successfully avoids the obstacle. Both
+scenarios demonstrate successful reference-free navigation in
+
+
+
+8 IEEE ROBOTICS AND AUTOMATION LETTERS. PREPRINT VERSION. ACCEPTED JANUARY, 2026
+
+References [25] A. Bhattacharya, N. Rao, D. Parikh, P. Kunapuli, Y. Wu, Y. Tao,
+N. Matni, and V. Kumar, “Vision transformers for end-to-end vision-
+
+[1] L. F. Recalde, B. S. Guevara, C. P. Carvajal, V. H. Andaluz, J. Varela- based quadrotor obstacle avoidance,” in IEEE International Conference
+Aldás, and D. C. Gandolfo, “System identification and nonlinear model on Robotics and Automation (ICRA). IEEE, 2025.
+predictive control with collision avoidance applied in hexacopters uavs,” [26] K. Lee, J. Gibson, and E. A. Theodorou, “Aggressive perception-aware
+Sensors, vol. 22, no. 13, 2022. navigation using deep optical flow dynamics and pixelmpc,” IEEE
+
+[2] J. Xing, G. Cioffi, J. Hidalgo-Carrió, and D. Scaramuzza, “Autonomous Robotics and Automation Letters, vol. 5, no. 2, pp. 1207–1214, 2020.
+power line inspection with drones via perception-aware MPC,” in IROS, [27] Z. Zhang and D. Scaramuzza, “Fisher information field: an efficient
+2023. and differentiable map for perception-aware planning,” 2020. [Online].
+
+[3] C. Papachristos, F. Mascarich, S. Khattak, T. Dang, and K. Alexis, Available: https://arxiv.org/abs/2008.03324
+“Localization uncertainty-aware autonomous exploration and mapping [28] J. Lim, N. Lawrance, F. Achermann, T. Stastny, R. Girod, and R. Sieg-
+with aerial robots using receding horizon path-planning,” Autonomous wart, “Fisher information based active planning for aerial photogram-
+Robots, vol. 43, no. 8, pp. 2131–2161, 2019. metry,” in ICRA. IEEE, 2023.
+
+[29] E. A. Theodorou and E. Todorov, “Relative entropy and free energy
+[4] A. Sridhar, D. Shah, C. Glossop, and S. Levine, “Nomad: Goal masked dualities: Connections to Path Integral and KL control,” in IEEE 51st
+
+diffusion policies for navigation and exploration,” in 2024 IEEE Interna- IEEE Conference on Decision and Control (CDC), Dec. 2012.
+tional Conference on Robotics and Automation (ICRA), 2024, pp. 63–70. [30] H. Xue, C. Pan, Z. Yi, G. Qu, and G. Shi, “Full-order sampling-based
+
+[5] A.-C. Cheng, Y. Ji, Z. Yang, X. Zou, J. Kautz, E. Biyik, H. Yin, S. Liu, mpc for torque-level locomotion control via diffusion-style annealing,”
+and X. Wang, “Navila: Legged robot vision-language-action model for in ICRA, 2025.
+navigation,” in RSS, 2025. [31] Y. Gao, F. Messerer, N. van Duijkeren, R. Dabir, and M. Diehl,
+
+[6] T. Cieslewski, E. Kaufmann, and D. Scaramuzza, “Rapid exploration “Semi-infinite programming for collision-avoidance in optimal and
+with multi-rotors: A frontier selection method for high speed flight,” in model predictive control,” 2025. [Online]. Available: https://arxiv.org/
+IROS, 2017. abs/2508.12335
+
+[7] M. Naazare, D. Ramos, J. Wildt, and D. Schulz, “Application of graph- [32] H. J. Suh, M. Simchowitz, K. Zhang, and R. Tedrake, “Do differen-
+based path planning for uavs to avoid restricted areas,” in IEEE Inter- tiable simulators give better policy gradients?” in Proceedings of the
+national Symposium on Safety, Security, and Rescue Robotics (SSRR), 39th International Conference on Machine Learning, ser. Proceedings
+2019. of Machine Learning Research, K. Chaudhuri, S. Jegelka, L. Song,
+
+[8] W. Liu, Y. Ren, and F. Zhang, “Integrated planning and control for C. Szepesvari, G. Niu, and S. Sabato, Eds., vol. 162. PMLR, 17–23
+quadrotor navigation in presence of suddenly appearing objects and Jul 2022, pp. 20 668–20 696.
+disturbances,” IEEE Robotics and Automation Letters, 2024. [33] J. L. Piovesan and H. G. Tanner, “Randomized model predictive control
+
+[9] M. W. Achtelik, S. Weiss, M. Chli, and R. Siegwart, “Path planning for for robot navigation,” in IEEE International Conference on Robotics and
+motion dependent state estimation on micro aerial vehicles,” in IEEE Automation. IEEE, 2009, pp. 94–99.
+International Conference on Robotics and Automation, 2013. [34] R. Y. Rubinstein, “Optimization of computer simulation models with
+
+[10] Y. Ren, F. Zhu, G. Lu, Y. Cai, L. Yin, F. Kong, J. Lin, N. Chen, rare events,” European Journal of Operational Research, 1997.
+and F. Zhang, “Safety-assured high-speed navigation for mavs,” Science [35] K. Chua, R. Calandra, R. McAllister, and S. Levine, “Deep rein-
+Robotics, vol. 10, no. 98, p. eado6187, 2025. forcement learning in a handful of trials using probabilistic dynamics
+
+[11] M. Hehn and R. D’Andrea, “Real-time trajectory generation for quadro- models,” in Proceedings of the 32nd International Conference on Neural
+copters,” IEEE Transactions on Robotics, 2015. Information Processing Systems, ser. NIPS’18. Red Hook, NY, USA:
+
+[12] M. Minařík, R. Pěnička, V. Vonásek, and M. Saska, “Model predictive Curran Associates Inc., 2018, p. 4759–4770.
+path integral control for agile unmanned aerial vehicles,” in IROS, 2024. [36] H. J. Kappen, “Linear Theory for Control of Nonlinear Stochastic
+
+[13] I. S. Mohamed, G. Allibert, and P. Martinet, “Model predictive path Systems,” Physical Review Letters, Nov. 2005.
+integral control framework for partially observable navigation: A quadro- [37] E. A. Theodorou, “Nonlinear Stochastic Control and Information The-
+tor case study,” in 2020 16th International Conference on Control, oretic Dualities: Connections, Interdependencies and Thermodynamic
+Automation, Robotics and Vision (ICARCV), 2020. Interpretations,” Entropy, no. 5, May 2015.
+
+[14] D. Falanga, P. Foehn, P. Lu, and D. Scaramuzza, “PAMPC: Perception- [38] G. Williams, A. Aldrich, and E. A. Theodorou, “Model predictive
+aware model predictive control for quadrotors,” in IROS, 2018. path integral control: From theory to parallel computation,” Journal of
+
+[15] M. Sarvaiya, G. Li, and G. Loianno, “Hpa-mpc: Hybrid perception- Guidance, Control, and Dynamics, vol. 40, no. 2, pp. 344–357, 2017.
+aware nonlinear model predictive control for quadrotors with suspended [39] J. Alvarez-Padilla, J. Z. Zhang, S. Kwok, J. M. Dolan, and Z. Manch-
+loads,” IEEE Robotics and Automation Letters, 2025. ester, “Real-time whole-body control of legged robots with model-
+
+[16] D. Mellinger and V. Kumar, “Minimum snap trajectory generation and predictive path integral control,” in ICRA, 2025.
+control for quadrotors,” in IEEE International Conference on Robotics [40] R. Reiter, J. Hoffmann, D. Reinhardt, F. Messerer, K. Baumgärtner,
+and Automation, 2011, pp. 2520–2525. S. Sawant, J. Boedecker, M. Diehl, and S. Gros, “Synthesis of model
+
+[17] B. Zhou, J. Pan, F. Gao, and S. Shen, “Raptor: Robust and perception- predictive control and reinforcement learning: Survey and classification,”
+aware trajectory replanning for quadrotor fast flight,” IEEE Transactions 2025. [Online]. Available: https://arxiv.org/abs/2502.02133
+on Robotics, vol. 37, no. 6, pp. 1992–2009, 2021. [41] H. Homburger, F. Messerer, M. Diehl, and J. Reuter, “Optimality and
+
+[18] Q. Yu, C. Qin, L. Luo, H. H.-T. Liu, and S. Hu, “CPA-planner: suboptimality of MPPI control in stochastic and deterministic settings,”
+Motion planner with complete perception awareness for sensing-limited IEEE Control Systems Letters, vol. 9, pp. 763–768, 2025.
+quadrotors,” IEEE Robotics and Automation Letters, 2022. [42] Y. Ren, Y. Cai, F. Zhu, S. Liang, and F. Zhang, “ROG-Map: An efficient
+
+robocentric occupancy grid map for large-scene and high-resolution
+[19] T. Marcucci, M. Petersen, D. von Wrangel, and R. Tedrake, “Motion lidar-based motion planning,” in IROS, 2024.
+
+planning around obstacles with convex optimization,” Science Robotics, [43] T. Howell, N. Gileadi, S. Tunyasuvunakool, K. Zakka, T. Erez, and
+2023. Y. Tassa, “Predictive sampling: Real-time behaviour synthesis with
+
+[20] Y. Gao, F. Messerer, N. v. Duijkeren, B. Houska, and M. Diehl, “Real- mujoco,” 2022. [Online]. Available: https://arxiv.org/abs/2212.00541
+time-feasible collision-free motion planning for ellipsoidal objects,” in [44] J. Amanatides and A. Woo, “A fast voxel traversal algorithm for ray
+2024 IEEE 63rd Conference on Decision and Control (CDC), 2024. tracing,” Proceedings of EuroGraphics, vol. 87, 08 1987.
+
+[21] R. Reiter, K. Baumgärtner, R. Quirynen, and M. Diehl, “Progressive [45] P. Foehn, E. Kaufmann, A. Romero, R. Penicka, S. Sun, L. Bauersfeld,
+smoothing for motion planning in real-time NMPC,” in European T. Laengle, G. Cioffi, Y. Song, A. Loquercio, and D. Scaramuzza,
+Control Conference (ECC), 2024, pp. 1816–1823. “Agilicious: Open-source and open-hardware agile quadrotor for vision-
+
+[22] X. Zhou, Z. Wang, H. Ye, C. Xu, and F. Gao, “EGO-planner: An ESDF- based flight,” Science Robotics, vol. 7, no. 67, p. eabl6259, 2022.
+free gradient-based local planner for quadrotors,” IEEE Robotics and [46] Y. Song, S. Naji, E. Kaufmann, A. Loquercio, and D. Scaramuzza,
+Automation Letters, vol. 6, no. 2, pp. 478–485, 2021. “Flightmare: A flexible quadrotor simulator,” in CoRL, 2020.
+
+[23] I. Yadav, M. Sebok, and H. G. Tanner, “Receding horizon navigation [47] S. K. Ramakrishnan, A. Gokaslan, E. Wijmans, O. Maksymets,
+and target tracking for aerial detection of transient radioactivity,” The A. Clegg, J. M. Turner, E. Undersander, W. Galuba, A. Westbury, A. X.
+International Journal of Robotics Research, 2023. Chang, M. Savva, Y. Zhao, and D. Batra, “Habitat-matterport 3d dataset
+
+[24] A. Loquercio, E. Kaufmann, R. Ranftl, M. Müller, V. Koltun, and (HM3d): 1000 large-scale 3d environments for embodied AI,” in Thirty-
+D. Scaramuzza, “Learning high-speed flight in the wild,” Science fifth Conference on Neural Information Processing Systems Datasets and
+Robotics, vol. 6, no. 59, p. eabg5810, 2021. Benchmarks Track, 2021.
+
+
+
+ZHAI et al.: PERCEPTION-AWARE MPPI FOR QUADROTOR NAVIGATION IN UNKNOWN ENVIRONMENTS 9
+
+[48] M. Dharmadhikari, P. De Petris, H. Nguyen, M. Kulkarni, N. Khedekar,
+and K. Alexis, “Manhole detection and traversal for exploration of ballast
+water tanks using micro aerial vehicles,” in International Conference on
+Unmanned Aircraft Systems (ICUAS), 2023, pp. 103–109.
