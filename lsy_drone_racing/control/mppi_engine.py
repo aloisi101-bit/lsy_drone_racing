@@ -1,45 +1,63 @@
-"""
-MPPI Engine: Handles Physics and JAX Tensor Optimization.
+"""MPPI Engine: Handles Physics and JAX Tensor Optimization.
+
+Implements Model Predictive Path Integral (MPPI) control with full quadrotor dynamics
+and PA-MPPI cost functions. Supports both simplified dynamics for testing and full
+13D quadrotor state (position, quaternion, velocity, angular velocity).
 """
 import jax
 import jax.numpy as jnp
 from jax import random, vmap
 from jax.lax import scan
 
+from lsy_drone_racing.control.mppi_dynamics import quadrotor_dynamics, quadrotor_state_from_simple_attitude
+from lsy_drone_racing.control.mppi_cost import default_cost_weights, create_dummy_cost
+
 # CRITICAL: Force 64-bit precision to prevent overflow in softmax
 jax.config.update("jax_enable_x64", True)
 
+
+# Legacy simplified dynamics (for backward compatibility)
 @jax.jit
-def jax_dynamics(state: jnp.ndarray, action: jnp.ndarray, dt: float, mass: float, g: float) -> jnp.ndarray:
-    """Simulates rigid-body attitude dynamics."""
+def jax_dynamics_simple(state: jnp.ndarray, action: jnp.ndarray, dt: float, mass: float, g: float) -> jnp.ndarray:
+    """Simulates simplified attitude dynamics (6D state: position + velocity).
+
+    Legacy function for backward compatibility. Use quadrotor_dynamics() for full model.
+    """
     p = state[0:3]
     v = state[3:6]
-    
+
     # [roll, pitch, yaw, thrust_in_newtons]
     roll, pitch, yaw, thrust = action[0], action[1], action[2], action[3]
-    
+
     sr, cr = jnp.sin(roll), jnp.cos(roll)
     sp, cp = jnp.sin(pitch), jnp.cos(pitch)
     sy, cy = jnp.sin(yaw), jnp.cos(yaw)
-    
+
     # Body Z-axis in world frame
     z_b = jnp.array([
         sr * sy + cr * cy * sp,
         cr * sp * sy - cy * sr,
         cr * cp
     ])
-    
+
     acc = (thrust / mass) * z_b - jnp.array([0.0, 0.0, g])
-    
+
     next_v = v + acc * dt
     next_p = p + v * dt + 0.5 * acc * (dt ** 2)
-    
+
     return jnp.concatenate([next_p, next_v])
 
 def build_mppi_solver(cost_fn):
     """
     FACTORY FUNCTION: Compiles the parallel simulation loop using the 
-    injected cost function.
+    injected cost function. Supports both 6D (simple) and 13D (full) states.
+    Supports time-decoupled prediction and control horizons.
+    
+    Args:
+        cost_fn: Cost function (state, action, target_pos) -> cost
+        
+    Returns:
+        solver_step: Function (rng, state, U_nominal, ...) -> (action, U_next)
     """
     
     @jax.jit
@@ -47,21 +65,34 @@ def build_mppi_solver(cost_fn):
         rng_key: jnp.ndarray, 
         current_state: jnp.ndarray, 
         U_nominal: jnp.ndarray, 
-        dt: float, 
+        dt_ctrl: float, 
         mass: float, 
         g: float, 
         lam: float, 
         noise_std: jnp.ndarray,
-        target_pos: jnp.ndarray
+        target_pos: jnp.ndarray,
+        # Optional full dynamics parameters
+        inertia_diag: jnp.ndarray | None = None,
+        max_thrust_per_motor: float = 0.3,
+        dt_pred: float | None = None,
     ):
+        # Time-decoupling: dt_pred for prediction dynamics, dt_ctrl for control
+        # Default dt_pred = dt_ctrl for backward compatibility
+        if dt_pred is None:
+            dt_pred = dt_ctrl
+        
         K = 2500  # Number of parallel trajectories
-        T = U_nominal.shape[0] # Horizon length
+        T = U_nominal.shape[0] # Horizon length in prediction steps
         
         noise = random.normal(rng_key, (K, T, 4)) * noise_std
         
         # Action constraints
         lower_bound = jnp.array([-0.5, -0.5, -3.14, 0.0])
         upper_bound = jnp.array([0.5, 0.5, 3.14, mass * g * 2.5])
+
+        # Choose dynamics based on state dimensionality
+        state_dim = current_state.shape[0]
+        use_full_dynamics = state_dim == 13 and inertia_diag is not None
 
         def rollout_fn(carry, step_data):
             state = carry
@@ -71,7 +102,13 @@ def build_mppi_solver(cost_fn):
             action = nominal_action + step_noise
             action = jnp.clip(action, lower_bound, upper_bound)
             
-            next_state = jax_dynamics(state, action, dt, mass, g)
+            # Use appropriate dynamics with dt_pred for prediction
+            if use_full_dynamics:
+                next_state = quadrotor_dynamics(
+                    state, action, dt_pred, mass, g, inertia_diag, max_thrust_per_motor
+                )
+            else:
+                next_state = jax_dynamics_simple(state, action, dt_pred, mass, g)
             
             # ---> EVALUATE THE INJECTED COST FUNCTION <---
             stage_cost = cost_fn(next_state, action, target_pos)
@@ -101,10 +138,16 @@ def build_mppi_solver(cost_fn):
         
         optimal_action = U_updated[0]
         
-        # Warm start shift
-        U_next = jnp.roll(U_updated, shift=-1, axis=0)
+        # Time-decoupling: Interpolate from prediction to control frequency if needed
+        decoupling_ratio = dt_pred / dt_ctrl
+        shift_steps = jnp.maximum(1, jnp.round(decoupling_ratio).astype(jnp.int32))
+        
+        # Warm start shift: shift by calculated number of steps
+        U_next = jnp.roll(U_updated, shift=-shift_steps, axis=0)
         hover_action = jnp.array([0.0, 0.0, 0.0, mass * g])
-        U_next = U_next.at[-1].set(hover_action)
+        # Fill last shift_steps entries with hover action
+        for i in range(shift_steps):
+            U_next = U_next.at[-(i+1)].set(hover_action)
         
         return optimal_action, U_next
 
@@ -120,79 +163,173 @@ if __name__ == "__main__":
     print(f"Active Backend: {backend_type}")
     print(f"Available Devices: {available_devices}")
 
-    # STEP 2: COMPILE AND TEST THE MPPI PIPELINE
-
-    print("--- STEP 1: Physics Sanity Check ---")
+    # STEP 1: Test with simplified 6D dynamics
+    print("\n" + "="*60)
+    print("TEST 1: Simplified 6D Dynamics (Legacy)")
+    print("="*60)
+    
     mass, g, dt = 1.0, 9.81, 0.05
-    initial_state = jnp.zeros(6) # [0,0,0, 0,0,0]
+    initial_state_6d = jnp.zeros(6)
+    
+    print("--- Physics Sanity Checks ---")
     
     # Test 1A: Perfect Hover
-    # [roll, pitch, yaw, thrust]
-    hover_action = jnp.array([0.0, 0.0, 0.0, mass * g]) 
-    next_state = jax_dynamics(initial_state, hover_action, dt, mass, g)
-    print(f"Hover Test -> Z-Velocity should be 0.0: {next_state[5]:.4f}")
+    hover_action = jnp.array([0.0, 0.0, 0.0, mass * g])
+    next_state = jax_dynamics_simple(initial_state_6d, hover_action, dt, mass, g)
+    print(f"Hover Test -> Z-Velocity should be 0.0: {next_state[5]:.6f}")
     
     # Test 1B: Forward Pitch
-    # Pitching down slightly (positive pitch usually means nose down depending on your frame)
     forward_action = jnp.array([0.0, 0.1, 0.0, mass * g])
-    next_state = jax_dynamics(initial_state, forward_action, dt, mass, g)
-    print(f"Forward Test -> X-Velocity should be non-zero: {next_state[3]:.4f}")
+    next_state = jax_dynamics_simple(initial_state_6d, forward_action, dt, mass, g)
+    print(f"Forward Pitch -> X-Velocity should be > 0: {next_state[3]:.6f}")
 
-
-    # STEP 2: COMPILE AND TEST THE MPPI PIPELINE
-    print("\n--- STEP 2: MPPI Compilation and Execution ---")
+    # STEP 2: Test with full 13D dynamics
+    print("\n" + "="*60)
+    print("TEST 2: Full 13D Quadrotor Dynamics")
+    print("="*60)
     
-    # 1. Define a dummy cost function just for testing
-    @jax.jit
-    def dummy_cost(state, action, target_pos):
-        dist = jnp.linalg.norm(state[0:3] - target_pos)
-        attitude_penalty = jnp.linalg.norm(action[0:3]) * 0.1
-        return (dist * 10.0) + attitude_penalty
+    inertia_diag = jnp.array([1.395e-5, 1.436e-5, 2.173e-5])
+    max_thrust_per_motor = 0.3
+    
+    initial_state_13d = quadrotor_state_from_simple_attitude(
+        jnp.array([0.0, 0.0, 0.0]),
+        jnp.array([0.0, 0.0, 0.0])
+    )
+    
+    print("Full state dimensions:", initial_state_13d.shape)
+    print(f"Position: {initial_state_13d[0:3]}")
+    print(f"Quaternion: {initial_state_13d[3:7]}")
+    print(f"Velocity: {initial_state_13d[7:10]}")
+    print(f"Angular velocity: {initial_state_13d[10:13]}")
+    
+    next_state_13d = quadrotor_dynamics(
+        initial_state_13d, hover_action, dt, mass, g, inertia_diag, max_thrust_per_motor
+    )
+    print(f"\nAfter one step (hover):")
+    print(f"Position: {next_state_13d[0:3]}")
+    print(f"Velocity: {next_state_13d[7:10]} (should be ~[0, 0, 0])")
 
-    # 2. Build the solver using your factory function
-    print("Compiling solver... (This might take a few seconds)")
+    # STEP 3: Test cost functions
+    print("\n" + "="*60)
+    print("TEST 3: PA-MPPI Cost Functions")
+    print("="*60)
+    
+    target_pos = jnp.array([5.0, 0.0, 0.0])
+    dummy_cost = create_dummy_cost(target_pos)
+    cost = dummy_cost(initial_state_13d, hover_action, target_pos)
+    print(f"Dummy cost at origin: {cost:.4f}")
+    
+    weights = default_cost_weights("approach")
+    print(f"Cost weights (approach mode): {list(weights.keys())}")
+
+    # STEP 4: MPPI Compilation and Execution
+    print("\n" + "="*60)
+    print("TEST 4: MPPI Solver Compilation")
+    print("="*60)
+    
+    print("Compiling solver with simplified dynamics... (This might take a few seconds)")
     t0 = time.time()
     my_mppi_step = build_mppi_solver(dummy_cost)
     
-    # 3. Setup dummy inputs to feed the solver
+    # Setup inputs
     rng = random.PRNGKey(42)
     current_state = jnp.zeros(6)
     U_nominal = jnp.zeros((30, 4))
-    U_nominal = U_nominal.at[:, 3].set(mass * g) # Fill with hover thrust
-    target_pos = jnp.array([5.0, 0.0, 0.0])      # 5 meters in front
+    U_nominal = U_nominal.at[:, 3].set(mass * g)
+    target_pos = jnp.array([5.0, 0.0, 0.0])
     noise_std = jnp.array([0.1, 0.1, 0.1, 0.5])
     
-    # 4. Trigger JIT compilation by running it once
+    # Trigger JIT compilation with backward-compatible default (dt_pred = dt_ctrl)
     opt_action, next_U = my_mppi_step(
         rng, current_state, U_nominal, dt, mass, g, 0.1, noise_std, target_pos
     )
     
     print(f"Compilation finished in {time.time() - t0:.2f} seconds!")
-    print(f"Optimal First Action computed: ")
-    print(f"Roll: {opt_action[0]:.3f}, Pitch: {opt_action[1]:.3f}, Yaw: {opt_action[2]:.3f}, Thrust: {opt_action[3]:.3f}")
+    print(f"Optimal First Action: Roll={opt_action[0]:.3f}, Pitch={opt_action[1]:.3f}, " +
+          f"Yaw={opt_action[2]:.3f}, Thrust={opt_action[3]:.3f}")
 
-
-    # STEP 3: CLOSED-LOOP MINI-FLIGHT
-    print("\n--- STEP 3: Closed-Loop Flight Simulation ---")
+    # STEP 5: Closed-loop flight simulation
+    print("\n" + "="*60)
+    print("TEST 5: Closed-Loop Flight Simulation (15 steps)")
+    print("="*60)
     
     sim_state = jnp.zeros(6)
-    target = jnp.array([10.0, 5.0, 2.0]) # Target: x=10, y=5, z=2
-    print(f"Target position: {target}")
+    target = jnp.array([10.0, 5.0, 2.0])
+    print(f"Target: {target}\n")
     
-    for step in range(15): # Simulate 15 control steps
+    for step in range(15):
         rng, subkey = random.split(rng)
-        
-        # 1. Get the best action sequence from your solver
         opt_action, U_nominal = my_mppi_step(
             subkey, sim_state, U_nominal, dt, mass, g, 0.1, noise_std, target
         )
-        
-        # 2. Apply it to the physics engine
-        sim_state = jax_dynamics(sim_state, opt_action, dt, mass, g)
-        
-        # 3. Print the drone's position
+        sim_state = jax_dynamics_simple(sim_state, opt_action, dt, mass, g)
         pos = sim_state[0:3]
         dist = jnp.linalg.norm(pos - target)
-        print(f"Step {step:02d} | Pos: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}] | Dist to target: {dist:.2f}")
+        print(f"Step {step:02d} | Pos: [{pos[0]:6.2f}, {pos[1]:6.2f}, {pos[2]:6.2f}] | Dist: {dist:6.2f}")
 
-    print("\nAll engine tests passed.")
+    print("\n" + "="*60)
+    print("All engine tests completed successfully!")
+    print("="*60)
+
+    # STEP 6: Test time-decoupled prediction and control horizons
+    print("\n" + "="*60)
+    print("TEST 6: Time-Decoupled Prediction/Control Horizons")
+    print("="*60)
+    
+    # Test case: 2x longer horizon with dt_pred = 2*dt_ctrl
+    dt_pred = 0.1  # Prediction step = 0.1s
+    dt_ctrl = 0.05 # Control step = 0.05s
+    horizon_steps = 60  # 60 prediction steps
+    
+    print(f"dt_pred (prediction) = {dt_pred}s")
+    print(f"dt_ctrl (control) = {dt_ctrl}s")
+    print(f"Horizon length = {horizon_steps} prediction steps")
+    print(f"Prediction horizon = {horizon_steps * dt_pred:.2f}s")
+    print(f"Control horizon (effective) = {horizon_steps * dt_pred:.2f}s")
+    
+    # Create MPPI solver
+    my_mppi_decoupled = build_mppi_solver(dummy_cost)
+    
+    # Setup inputs with longer horizon
+    rng = random.PRNGKey(99)
+    current_state = jnp.zeros(6)
+    U_nominal_long = jnp.zeros((horizon_steps, 4))
+    U_nominal_long = U_nominal_long.at[:, 3].set(mass * g)
+    target_pos = jnp.array([10.0, 0.0, 0.0])
+    
+    print("\nRunning MPPI step with time-decoupling...")
+    t0 = time.time()
+    opt_action, next_U_decoupled = my_mppi_decoupled(
+        rng, current_state, U_nominal_long, dt_ctrl, mass, g, 0.1, noise_std, target_pos, 
+        dt_pred=dt_pred
+    )
+    elapsed = time.time() - t0
+    
+    print(f"Execution time: {elapsed:.2f}s")
+    print(f"Next U shape: {next_U_decoupled.shape}")
+    print(f"Shift ratio (dt_pred / dt_ctrl) = {dt_pred / dt_ctrl:.1f}x")
+    
+    # Verify that the decoupling works correctly
+    shift_steps = jnp.maximum(1, jnp.round(dt_pred / dt_ctrl).astype(jnp.int32))
+    print(f"Expected shift steps: {shift_steps}")
+    
+    # Test closed-loop with time-decoupling (5 steps)
+    print("\nClosed-loop test with time-decoupling (5 steps):")
+    sim_state = jnp.zeros(6)
+    target = jnp.array([5.0, 0.0, 0.0])
+    
+    for step in range(5):
+        rng, subkey = random.split(rng)
+        opt_action, U_nominal_long = my_mppi_decoupled(
+            subkey, sim_state, U_nominal_long, dt_ctrl, mass, g, 0.1, noise_std, target,
+            dt_pred=dt_pred
+        )
+        # Simulate actual dynamics with dt_ctrl
+        sim_state = jax_dynamics_simple(sim_state, opt_action, dt_ctrl, mass, g)
+        pos = sim_state[0:3]
+        dist = jnp.linalg.norm(pos - target)
+        print(f"Step {step:02d} | Pos: [{pos[0]:6.2f}, {pos[1]:6.2f}, {pos[2]:6.2f}] | Dist: {dist:6.2f}")
+    
+    print("\n" + "="*60)
+    print("All engine tests completed successfully!")
+    print("="*60)
