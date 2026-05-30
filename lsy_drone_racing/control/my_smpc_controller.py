@@ -1,161 +1,493 @@
-"""
-*** IMPORTANT NOTE:***
-Static vs. Dynamic Arrays in JAX: JAX relies heavily on static array sizes to compile efficiently. When you pass obs["obstacles_pos"] to your JIT-compiled functions in Level 2, the number of detected obstacles might change from step to step (e.g., 0 obstacles seen, then 2 seen). JAX will trigger a slow recompilation every time the array size changes. You must pad your obstacle array to a fixed maximum size (e.g., shape (5, 3)) and use a dummy position (like [999.0, 999.0, 999.0]) for empty slots.
-
-Action Space Mapping: You noted # Output exactly what the 'attitude' control mode expects. Double-check lsy_drone_racing/envs/drone_race.py. The attitude control mode in drone models usually maps inputs as [thrust, roll, pitch, yaw] or [roll, pitch, yaw, thrust]. Make sure your jax_dynamics unwraps the array in the exact same order your controller returns it to the environment!
-"""
-
-
-"""
-Main Controller Logic: Track parsing, Target logic, and Cost Function definition.
-"""
+"""SMPC Controller for Drone Racing - Fixed Level 0 Implementation with proper MPPI."""
 from __future__ import annotations
 
-import numpy as np
-import jax.numpy as jnp
-from jax import random
-from jax import random
 from typing import TYPE_CHECKING
+from functools import partial
 
-from lsy_drone_racing.control.controller import Controller
+import jax
+import jax.numpy as jnp
+import numpy as np
+import os
+import logging
+from scipy.spatial.transform import Rotation as R
 from drone_models.core import load_params
 
-# FIXED: Absolute import to bypass importlib dynamic loading issues
-from lsy_drone_racing.control.mppi_engine import build_mppi_solver
-
-# FIXED: Absolute import to bypass importlib dynamic loading issues
-from lsy_drone_racing.control.mppi_engine import build_mppi_solver
+from crazyflow.sim.visualize import draw_line, draw_points
+from lsy_drone_racing.control import Controller
+from lsy_drone_racing.control.mppi_engine import MPPIEngine
 
 if TYPE_CHECKING:
+    from crazyflow import Sim
     from numpy.typing import NDArray
 
-class MPPIControllerJAX(Controller):
-    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+
+class MySMPCController(Controller):
+    """Sampling-based MPC controller with corrected dynamics and cost function."""
+
+    def __init__(self, obs: dict, info: dict, config: dict):
         super().__init__(obs, info, config)
-        
-        # 1. Physics Data
-        # 1. Physics Data
-        self.drone_params = load_params("so_rpy", config.sim.drone_model)
-        self.mass = float(self.drone_params["mass"])
-        self.g = float(abs(self.drone_params["gravity_vec"][2]))
-        self.dt = 1.0 / config.env.freq
-        
-        # 2. MPPI Config
-        self.T = 30  
-        # 2. MPPI Config
-        self.T = 30  
-        self.lam = 0.1
-        self.noise_std = jnp.array([0.1, 0.1, 0.1, 0.5])
-        
-        # 3. Track Data 
-        # 3. Track Data 
-        self.gates = jnp.array([g["pos"] for g in config.env.track.gates], dtype=jnp.float64)
-        self.gate_tolerance = 0.4
-        
-        # 4. INJECT COST FUNCTION
-        self.mppi_step = build_mppi_solver(self.evaluate_trajectory_cost)
-        
-        # 5. Initialize dynamic states (target_idx, U_nominal, rng_key)
-        # 4. INJECT COST FUNCTION
-        self.mppi_step = build_mppi_solver(self.evaluate_trajectory_cost)
-        
-        # 5. Initialize dynamic states (target_idx, U_nominal, rng_key)
-        self.episode_reset()
 
-    # ========================================================
-    # THE COST FUNCTION (Sandro's Workspace)
-    # ========================================================
-    @staticmethod
-    def evaluate_trajectory_cost(state: jnp.ndarray, action: jnp.ndarray, target_pos: jnp.ndarray) -> float:
-        """Evaluates how good or bad a specific predicted state is."""
-        pos = state[0:3]
-        
-        # Reward: Distance to target gate
-        dist_to_gate = jnp.linalg.norm(pos - target_pos)
-        
-        # Penalty: Aggressive attitude flying
-        attitude_penalty = jnp.linalg.norm(action[0:3]) 
-        
-        return (dist_to_gate * 15.0) + (attitude_penalty * 0.05)
-    # ========================================================
+        # --- Environment & Physical Parameters ---
+        self._freq = config.env.freq
+        self.dt = 1.0 / self._freq
+        self._tick = 0
+        self._finished = False
 
-    # ========================================================
-    # THE COST FUNCTION (Sandro's Workspace)
-    # ========================================================
-    @staticmethod
-    def evaluate_trajectory_cost(state: jnp.ndarray, action: jnp.ndarray, target_pos: jnp.ndarray) -> float:
-        """Evaluates how good or bad a specific predicted state is."""
-        pos = state[0:3]
-        
-        # Reward: Distance to target gate
-        dist_to_gate = jnp.linalg.norm(pos - target_pos)
-        
-        # Penalty: Aggressive attitude flying
-        attitude_penalty = jnp.linalg.norm(action[0:3]) 
-        
-        return (dist_to_gate * 15.0) + (attitude_penalty * 0.05)
-    # ========================================================
+        drone_params = load_params(config.sim.physics, config.sim.drone_model)
+        self.drone_mass = float(drone_params["mass"])
+        self.g = 9.81
+        self.hover_thrust = self.drone_mass * self.g
 
-    def compute_control(self, obs: dict[str, NDArray[np.floating]], info: dict | None = None) -> NDArray[np.floating]:
-        # CRITICAL: Cast to float64 immediately
-        # CRITICAL: Cast to float64 immediately
-        current_pos = jnp.array(obs["pos"], dtype=jnp.float64)
-        current_vel = jnp.array(obs["vel"], dtype=jnp.float64)
-        current_state = jnp.concatenate([current_pos, current_vel])
+        # --- Track Setup ---
+        self.obstacles_np = np.array([o["pos"] for o in config.env.track.obstacles])
+        self.spawn_pos = np.array(obs["pos"], dtype=float)
         
-        # Update Target Gate Progression
-        # Update Target Gate Progression
-        if jnp.linalg.norm(current_pos - self.gates[self.target_idx]) < self.gate_tolerance:
-            if self.target_idx < len(self.gates) - 1:
-                self.target_idx += 1
-                
-                
-        target_pos = self.gates[self.target_idx]
-        
-        # Advance RNG
-        # Advance RNG
-        self.rng_key, subkey = random.split(self.rng_key)
-        
-        # Call the JIT-Compiled Engine
-        optimal_action, self.U_nominal = self.mppi_step(
-        # Call the JIT-Compiled Engine
-        optimal_action, self.U_nominal = self.mppi_step(
-            subkey, 
-            current_state, 
-            self.U_nominal, 
-            self.dt, 
-            self.mass, 
-            self.g, 
-            self.lam, 
-            self.noise_std,
-            target_pos
-            self.noise_std,
-            target_pos
+        gates_config = config.env.track.gates
+        self.num_gates = len(gates_config)
+
+        # Precompute gate waypoints (center + forward/backward anchors for smooth passage)
+        self.waypoints = []
+        self.gate_dirs = []
+        self.all_gate_poses = []
+        self.all_gate_dirs = []  
+
+        for g in gates_config:
+            gate_pos = np.array(g["pos"], dtype=float)
+            gate_rpy = np.array(g["rpy"], dtype=float)
+
+            rot = R.from_euler("xyz", gate_rpy)
+            forward_dir = rot.apply(np.array([1.0, 0.0, 0.0]))
+            forward_dir[2] = 0.0  # Keep trajectory in XY plane
+            norm = np.linalg.norm(forward_dir)
+            forward_dir = forward_dir / norm if norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+
+            # NEW: Save the actual physical gate locations and directions
+            self.all_gate_poses.append(gate_pos.copy())
+            self.all_gate_dirs.append(forward_dir.copy())
+
+            # Pre and post targets for smoother passage through gates
+            pre_wp = gate_pos - forward_dir * 0.20
+            center_wp = gate_pos.copy()
+            post_wp = gate_pos + forward_dir * 0.20
+
+            self.waypoints.extend([pre_wp, center_wp, post_wp])
+            self.gate_dirs.extend([forward_dir, forward_dir, forward_dir])
+
+        self.waypoints = jnp.array(self.waypoints)
+        self.gate_dirs = jnp.array(self.gate_dirs)
+        # NEW: Convert to JAX arrays for the cost function
+        self.all_gate_poses_jnp = jnp.array(self.all_gate_poses)
+        self.all_gate_dirs_jnp = jnp.array(self.all_gate_dirs)
+
+        self.active_wp_idx = 0
+
+        # --- Logging ---
+        log_dir = os.path.dirname(__file__)
+        log_path = os.path.join(log_dir, "smpc_debug.log")
+        self._logger = logging.getLogger("lsy_smpc_debug")
+        if not any(isinstance(h, logging.FileHandler) for h in self._logger.handlers):
+            fh = logging.FileHandler(log_path, mode="a")
+            fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+            self._logger.addHandler(fh)
+            self._logger.setLevel(logging.INFO)
+
+        self.debug = getattr(config, "debug", True)
+
+        # --- MPPI Configuration ---
+        self.H = 30  # Reasonable horizon (0.5s at 50Hz env)
+        self.K = 5000  # Reduced but focused samples
+
+        # Noise exploration: [roll, pitch, yaw_rate, thrust]
+        noise_std = jnp.array([0.15, 0.15, 0.30, 0.1])
+
+        self.engine = MPPIEngine(
+            num_samples=self.K,
+            horizon=self.H,
+            dim_u=4,
+            lambda_=0.08,  # Temperature for weight distribution
+            noise_std=noise_std,
         )
-        
-        # Cast back to float32 for Simulator
-        action = np.array(optimal_action, dtype=np.float32)
-        # Cast back to float32 for Simulator
-        action = np.array(optimal_action, dtype=np.float32)
-        
-        # Failsafe: Add 10% extra thrust to hover so it doesn't instantly hit the floor if NaNs occur
-        if np.isnan(action).any():
-            action = np.array([0.0, 0.0, 0.0, self.mass * self.g * 1.1], dtype=np.float32)
-            
-        return action
-        # Failsafe: Add 10% extra thrust to hover so it doesn't instantly hit the floor if NaNs occur
-        if np.isnan(action).any():
-            action = np.array([0.0, 0.0, 0.0, self.mass * self.g * 1.1], dtype=np.float32)
-            
-        return action
 
-    def episode_reset(self):
-        """CRITICAL: Called by __init__ and between runs by the simulator."""
-        """CRITICAL: Called by __init__ and between runs by the simulator."""
-        self.target_idx = 0
-        self.rng_key = random.PRNGKey(42)
+        # Initialize nominal with gentle forward bias (helps cold start)
+        self.nominal_seq = jnp.zeros((self.H, 4))
+        self.nominal_seq = self.nominal_seq.at[:, 0].set(0.05)  # Gentle forward tilt
+        self.nominal_seq = self.nominal_seq.at[:, 3].set(self.hover_thrust * 1.1)  # Slight lift
+        self.rng_key = jax.random.PRNGKey(42)
+
+        self.planned_trajectory = None
+
+    @staticmethod
+    def _dynamics_fn(state: jnp.ndarray, action: jnp.ndarray, params: dict) -> jnp.ndarray:
+        """Proper kinematic rigid body dynamics with correct physics."""
+        dt = params["dt"]
+        mass = params["mass"]
+        g = params["g"]
+
+        pos = state[0:3]
+        vel = state[3:6]
+        rpy = state[6:9]
+
+        roll, pitch, yaw = rpy[0], rpy[1], rpy[2]
+
+        # Clamp attitude commands to reasonable limits
+        cmd_roll = jnp.clip(action[0], -0.45, 0.45)
+        cmd_pitch = jnp.clip(action[1], -0.45, 0.45)
+        cmd_yaw_rate = jnp.clip(action[2], -2.0, 2.0)  # rad/s limit
+        cmd_thrust = jnp.clip(action[3], 0.0, mass * g * 2.5)
+
+        # Attitude rate integration - smoothed transition toward commanded attitude
+        # Instead of instantaneous attitude changes, smooth out the commands
+        roll_rate = (cmd_roll - roll) * 5.0  # Proportional toward command
+        pitch_rate = (cmd_pitch - pitch) * 5.0
+        yaw_rate = cmd_yaw_rate
+
+        # Integrate attitudes
+        next_roll = roll + roll_rate * dt
+        next_pitch = pitch + pitch_rate * dt
+        next_yaw = yaw + yaw_rate * dt
+
+        # Compute rotation matrix from integrated RPY
+        cy, sy = jnp.cos(next_yaw), jnp.sin(next_yaw)
+        cr, sr = jnp.cos(next_roll), jnp.sin(next_roll)
+        cp, sp = jnp.cos(next_pitch), jnp.sin(next_pitch)
+
+        # Body Z-axis in world frame (where thrust acts)
+        # This is column 3 of the rotation matrix (from body to world)
+        bz_x = cy * sp * cr + sy * sr
+        bz_y = sy * sp * cr - cy * sr
+        bz_z = cp * cr
+
+        # Thrust acceleration in world frame
+        thrust_acc = jnp.array([bz_x, bz_y, bz_z]) * cmd_thrust / mass
+
+        # Gravity and drag
+        gravity_acc = jnp.array([0.0, 0.0, -g])
+        drag_coeff = 0.0  # Reduced from 0.25 for more responsiveness
+        drag_acc = -drag_coeff * vel
+
+        total_acc = thrust_acc + gravity_acc + drag_acc
+
+        # Integrate velocity and position
+        next_vel = vel + total_acc * dt
+        next_pos = pos + vel * dt + 0.5 * total_acc * dt * dt
+
+        return jnp.concatenate([next_pos, next_vel, jnp.array([next_roll, next_pitch, next_yaw])])
+
+    @staticmethod
+    def _cost_fn(state: jnp.ndarray, action: jnp.ndarray, next_state: jnp.ndarray, params: dict) -> jnp.ndarray:
+        """Stage cost metric mapping optimized trajectories."""
+        pos = next_state[0:3]
+        vel = next_state[3:6]
+        target = params["target"]
+        g_dir = params["g_dir"]
+        obstacles = params["obstacles"]
+       
+
         
-        hover_seq = jnp.zeros((self.T, 4), dtype=jnp.float64)
-        hover_seq = jnp.zeros((self.T, 4), dtype=jnp.float64)
-        hover_seq = hover_seq.at[:, 3].set(self.mass * self.g)
-        self.U_nominal = hover_seq
+
+        # 1. Positional Attraction Cost
+        diff = pos - target
+        dist_to_target = jnp.linalg.norm(diff)
+        
+        xy_dist = jnp.linalg.norm(diff[:2])
+        z_dist = jnp.abs(diff[2])
+
+        raw_pos_cost = xy_dist * 20.0 + (z_dist ** 2) * 40.0
+        
+        # CLIP RESTORED: Capped at 600.0 to prevent waypoint shock.
+        #cost = jnp.clip(raw_pos_cost, 0.0, 600.0)
+        cost = raw_pos_cost  # No clipping, let the optimizer feel the full gradient to the target.
+        
+       # 2. Cross-Track Error (Virtual Tube)
+        rel_pos = pos - target
+        longitudinal_dist = jnp.dot(rel_pos, g_dir)
+        cross_track_vec = rel_pos - (longitudinal_dist * g_dir)
+        cross_track_error = jnp.linalg.norm(cross_track_vec)
+
+        # A. STRICT GEOMETRIC FUNNEL (The Hard Wall)
+        # Prevents the drone from flying too wide
+        longitudinal_dist_abs = jnp.abs(longitudinal_dist)
+        funnel_radius = 0.15 + (longitudinal_dist_abs * 1.0)
+        
+        raw_tube_penalty = jnp.where(cross_track_error > funnel_radius, (cross_track_error - funnel_radius) * 200.0, 0.0)
+        #cost += jnp.clip(raw_tube_penalty, 0.0, 400.0) 
+        cost += raw_tube_penalty  # No clipping, let the optimizer feel the full gradient to stay in the funnel.\
+
+
+        # --- B. CENTERLINE ATTRACTION (The Gravity Well) ---
+        # Gently but constantly pulls the drone into the absolute dead center of the track.
+        # Because this is not capped, the optimizer will always try to minimize it.
+        cost += cross_track_error * 15.0
+
+        # ---------------------------------------------------------
+        # 3. GLOBAL STRICT GATE FRAME PENALTY (All Gates at once)
+        # ---------------------------------------------------------
+        all_gate_poses = params.get("all_gate_poses")
+        all_gate_dirs = params.get("all_gate_dirs")
+
+        if all_gate_poses is not None and all_gate_poses.shape[0] > 0:
+            # 1. Calculate relative positions to ALL gates at once
+            rel_poses = pos[None, :] - all_gate_poses # Shape: (N, 3)
+
+            # 2. Construct local coordinate axes for ALL gates
+            up = jnp.array([0.0, 0.0, 1.0])
+            dots = jnp.sum(all_gate_dirs * up, axis=1)
+            
+            # Broadcast the 'up' vector (fallback for vertical gates)
+            up_vecs = jnp.where(
+                jnp.abs(dots)[:, None] > 0.99, 
+                jnp.array([0.0, 1.0, 0.0]), 
+                jnp.tile(up, (all_gate_dirs.shape[0], 1))
+            )
+            
+            g_y = jnp.cross(all_gate_dirs, up_vecs)
+            g_y = g_y / (jnp.linalg.norm(g_y, axis=1, keepdims=True) + 1e-6)
+            g_z = jnp.cross(g_y, all_gate_dirs)
+
+            # 3. Project distance onto local axes using row-wise dot products
+            dx = jnp.sum(rel_poses * all_gate_dirs, axis=1)
+            dy = jnp.sum(rel_poses * g_y, axis=1)
+            dz = jnp.sum(rel_poses * g_z, axis=1)
+
+            # 4. Define collision boxes for all gates
+            near_gate_plane = jnp.abs(dx) < 0.15
+            inside_outer_box = (jnp.abs(dy) < 0.46) & (jnp.abs(dz) < 0.46)
+            outside_safe_inner_box = (jnp.abs(dy) > 0.15) | (jnp.abs(dz) > 0.15)
+
+            # Check if hitting ANY frame
+            hitting_frames = near_gate_plane & inside_outer_box & outside_safe_inner_box
+            
+            # If it hits ANY frame, slam it with the 10000.0 penalty
+            # Note: We removed the '* is_gate' mask. The physical frames are always dangerous.
+            cost += jnp.sum(jnp.where(hitting_frames, 10000.0, 0.0))
+        # ---------------------------------------------------------
+        # 3. Velocity Alignment & Speed Limit
+        speed = jnp.linalg.norm(vel) + 1e-5
+        vel_dir = vel / speed
+        target_dir = -diff / (dist_to_target + 1e-5) 
+        
+        cost += (1.0 - jnp.dot(vel_dir, target_dir)) * 10.0 * speed
+        cost += (1.0 - jnp.dot(vel_dir, g_dir)) * 8.0 * speed 
+        
+        cost += (speed ** 2) * 1.5 
+
+        # 4. Obstacle Avoidance (Dominant Repulsion)
+        if obstacles.shape[0] > 0:
+            obs_xy = obstacles[:, :2]
+            pos_xy = pos[:2]
+            dist_to_obs = jnp.linalg.norm(obs_xy - pos_xy[None, :], axis=1)
+            
+            # MASSIVE GRADIENT INCREASE: Bumped from 100.0 to 1500.0.
+            # At 0.40m away, penalty is 0.
+            # At 0.25m away (deep in the bubble), penalty is (0.40 - 0.25) * 1500 = 225.0.
+            # This 225.0 penalty easily overpowers the tube penalty, pushing the drone out of the funnel decisively.
+            repulsion_field = jnp.sum(
+                jnp.where(
+                    dist_to_obs < 0.30, 
+                    (0.30 - dist_to_obs) * 1000.0, 
+                    0.0
+                )
+            )
+            
+            hard_crash = jnp.sum(jnp.where(dist_to_obs < 0.10, 2000.0, 0.0))
+            cost += (repulsion_field + hard_crash)
+        
+        # 6. Out-of-Bounds Arena Guardrail Constraints
+        oob = (pos[0] < -2.4) | (pos[0] > 2.4) | (pos[1] < -1.4) | (pos[1] > 1.4) | (pos[2] < 0.05) | (pos[2] > 1.95)
+        cost += jnp.where(oob, 500.0, 0.0)
+
+        # 7. Actuator Smoothing
+        cost += (action[0]**2 + action[1]**2) * 5.0
+        cost += ((action[3] - params["hover_thrust"]) ** 2) * 2.0
+
+
+        return cost
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def _rollout_traj(self, state: jnp.ndarray, action_seq: jnp.ndarray, params: dict) -> jnp.ndarray:
+        """Forward simulates action sequence for visualization."""
+        def scan_fn(s, a):
+            next_s = self._dynamics_fn(s, a, params)
+            return next_s, next_s[:3]
+        _, pos_seq = jax.lax.scan(scan_fn, state, action_seq)
+        return pos_seq
+
+    def compute_control(self, obs: dict, info: dict | None = None) -> np.ndarray:
+        """Main control loop."""
+        pos = np.array(obs["pos"])
+
+        # If we've gone through all waypoints, loop back to last one
+        if self.active_wp_idx >= len(self.waypoints):
+            self.active_wp_idx = len(self.waypoints) - 1
+
+        current_target = np.array(self.waypoints[self.active_wp_idx])
+        vec_to_target = current_target - pos
+        dist_to_wp = np.linalg.norm(vec_to_target)
+
+        # Tight waypoint switching: just distance, no "passed plane" logic
+        # This prevents overshooting
+        if dist_to_wp < 0.15 and self.active_wp_idx < len(self.waypoints) - 1:
+            self.active_wp_idx += 1
+            current_target = np.array(self.waypoints[self.active_wp_idx])
+
+        # Get current state
+        rpy = R.from_quat(obs["quat"]).as_euler("xyz", degrees=False)
+        current_state = jnp.array([
+            obs["pos"][0], obs["pos"][1], obs["pos"][2],
+            obs["vel"][0], obs["vel"][1], obs["vel"][2],
+            rpy[0], rpy[1], rpy[2]
+        ])
+
+        # Pack simulation parameters
+        params = {
+            "dt": self.dt,
+            "mass": self.drone_mass,
+            "g": self.g,
+            "hover_thrust": self.hover_thrust,
+            "target": jnp.array(current_target),
+            "g_dir": jnp.array(self.gate_dirs[self.active_wp_idx]),
+            "obstacles": jnp.array(self.obstacles_np) if len(self.obstacles_np) > 0 else jnp.array([[]]),
+           
+            # --- NEW LINES ---
+            "all_gate_poses": self.all_gate_poses_jnp,
+            "all_gate_dirs": self.all_gate_dirs_jnp
+        }
+
+        # MPPI optimization
+        self.rng_key, subkey = jax.random.split(self.rng_key)
+        optimal_seq, traj_costs = self.engine.optimize(
+            current_state,
+            self.nominal_seq,
+            subkey,
+            params,
+            dynamics_fn=self._dynamics_fn,
+            cost_fn=self._cost_fn,
+            debug=False
+        )
+
+        action = optimal_seq[0]
+
+        # Calculate visualization trajectory
+        pos_seq = self._rollout_traj(current_state, optimal_seq, params)
+        self.planned_trajectory = np.array(jax.device_get(pos_seq))
+
+        # Shift nominal sequence for MPC memory (always look ahead)
+        shifted_seq = jnp.vstack([optimal_seq[1:], optimal_seq[-1:]])
+        # Fill tail with smooth hover commands
+        shifted_seq = shifted_seq.at[-1, 3].set(self.hover_thrust)
+        shifted_seq = shifted_seq.at[-1, 0:2].set(0.0)
+        self.nominal_seq = shifted_seq
+
+        # Saturate actions
+        min_action = jnp.array([-0.5, -0.5, -2.0, 0.0])
+        max_action = jnp.array([0.5, 0.5, 2.0, self.drone_mass * self.g * 2.5])
+        action = jnp.clip(action, min_action, max_action)
+
+        if self.debug:
+            self._print_debug(obs, current_target, traj_costs, action)
+
+        return np.array(jax.device_get(action), dtype=np.float32)
+
+    def render_callback(self, sim: Sim):
+        """Visualize trajectory, target, waypoints, and the 3D Geometric Funnel."""
+        if hasattr(self, 'waypoints') and len(self.waypoints) > 0:
+            draw_points(sim, np.array(self.waypoints), rgba=(0.0, 1.0, 0.0, 0.3), size=0.03)
+
+        if hasattr(self, 'active_wp_idx') and self.active_wp_idx < len(self.waypoints):
+            target_pos = np.array(self.waypoints[self.active_wp_idx])
+            g_dir = np.array(self.gate_dirs[self.active_wp_idx])
+
+            # Draw the active target point (solid red)
+            draw_points(sim, target_pos.reshape(1, -1), rgba=(1.0, 0.0, 0.0, 1.0), size=0.05)
+
+            # --- NEW: Draw 3D Wireframe Geometric Funnel ---
+            base_gate_radius = 0.15
+            funnel_slope = 1.0  # Must match the dist_to_target multiplier in _cost_fn
+            
+            # Draw rings at these distances extending BACKWARDS from the gate
+            # e.g., 0.0m, 0.5m, 1.0m, and 1.5m away
+            offsets = [0.0, -0.5, -1.0, -1.5]
+
+            # 1. Calculate two vectors (u, v) perpendicular to the gate direction
+            up = np.array([0.0, 0.0, 1.0])
+            if np.abs(np.dot(g_dir, up)) > 0.99:
+                up = np.array([0.0, 1.0, 0.0]) # Fallback if gate points straight up
+            
+            u = np.cross(g_dir, up)
+            u = u / (np.linalg.norm(u) + 1e-6)
+            v = np.cross(g_dir, u)
+
+            angles = np.linspace(0, 2 * np.pi, 20)
+            ring_points_list = []
+
+            # 2. Draw rings with expanding radii
+            for offset_dist in offsets:
+                # Calculate the exact radius the cost function sees at this distance
+                current_radius = base_gate_radius + (abs(offset_dist) * funnel_slope)
+                
+                ring_center = target_pos + (g_dir * offset_dist)
+                circle_offsets = np.array([np.cos(a) * u + np.sin(a) * v for a in angles]) * current_radius
+                ring_points = ring_center + circle_offsets
+                
+                draw_line(sim, ring_points, rgba=(1.0, 1.0, 0.0, 0.5))
+                ring_points_list.append(ring_points)
+
+            # 3. Draw longitudinal connecting lines (the "walls" of the funnel)
+            if len(ring_points_list) > 1:
+                smallest_ring = ring_points_list[0]   # At the gate
+                largest_ring = ring_points_list[-1]   # Furthest away
+                
+                for i in [0, 5, 10, 15]: 
+                    start_pt = largest_ring[i]
+                    end_pt = smallest_ring[i]
+                    draw_line(sim, np.vstack([start_pt, end_pt]), rgba=(1.0, 1.0, 0.0, 0.3))
+            # -----------------------------------
+
+        
+
+        # Draw the MPPI planned trajectory horizon (blue line)
+        if hasattr(self, 'planned_trajectory') and self.planned_trajectory is not None:
+            draw_line(sim, self.planned_trajectory, rgba=(0.0, 0.0, 1.0, 1.0))
+
+    def step_callback(self, action, obs, reward, terminated, truncated, info) -> bool:
+        self._tick += 1
+        if terminated or truncated:
+            self._finished = True
+        return self._finished
+
+    def episode_callback(self):
+        self._tick = 0
+        self._finished = False
+        self.active_wp_idx = 0
+        self.nominal_seq = jnp.zeros((self.H, 4))
+        self.nominal_seq = self.nominal_seq.at[:, 3].set(self.hover_thrust)
+        self.rng_key = jax.random.PRNGKey(42)
+
+    def _print_debug(self, obs, target_np, traj_costs, action):
+        """Log debug information."""
+        pos = obs["pos"]
+        try:
+            costs_np = np.array(jax.device_get(traj_costs))
+            act_np = np.array(jax.device_get(action))
+            dist_to_target = np.linalg.norm(pos - target_np)
+
+            if len(self.obstacles_np) > 0:
+                dists_obs = np.linalg.norm(self.obstacles_np[:, :2] - pos[:2], axis=1)
+                nearest_obs = dists_obs.min()
+            else:
+                nearest_obs = 999.0
+
+            gate_idx = self.active_wp_idx // 3
+            msg = (
+                f"[SMPC] pos={pos.round(3)} tgt={target_np.round(3)} "
+                f"dist={dist_to_target:.3f} obs={nearest_obs:.3f} "
+                f"cost_min/mean={costs_np.min():.1f}/{costs_np.mean():.1f} "
+                f"act={act_np.round(3)} wp={self.active_wp_idx} gate={gate_idx}"
+            )
+            print(msg)
+            try:
+                self._logger.info(msg)
+            except Exception:
+                pass
+        except Exception:
+            pass
