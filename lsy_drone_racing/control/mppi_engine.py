@@ -4,6 +4,7 @@ Implements Model Predictive Path Integral (MPPI) control with full quadrotor dyn
 and PA-MPPI cost functions. Supports both simplified dynamics for testing and full
 13D quadrotor state (position, quaternion, velocity, angular velocity).
 """
+
 import jax
 import jax.numpy as jnp
 from jax import random, vmap
@@ -146,16 +147,10 @@ def build_mppi_solver(cost_fn, dynamics_fn):
         min_cost = jnp.min(costs)
         mean_cost = jnp.mean(costs)
         
-        # Time-decoupling: Interpolate from prediction to control frequency if needed
-        decoupling_ratio = dt_pred / dt_ctrl
-        shift_steps = int(round(dt_pred / dt_ctrl))
-        
-        # Warm start shift: shift by calculated number of steps
-        U_next = jnp.roll(U_updated, shift=-shift_steps, axis=0)
+        # Warm start shift (simplified: always shift by 1 step)
+        U_next = jnp.roll(U_updated, shift=-1, axis=0)
         hover_action = jnp.array([0.0, 0.0, 0.0, mass * g])
-        # Fill last shift_steps entries with hover action
-        for i in range(shift_steps):
-            U_next = U_next.at[-(i+1)].set(hover_action)
+        U_next = U_next.at[-1].set(hover_action)
         
         return optimal_action, U_next, min_cost, mean_cost
 
