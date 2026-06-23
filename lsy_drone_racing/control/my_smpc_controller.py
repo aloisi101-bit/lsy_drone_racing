@@ -71,7 +71,7 @@ class MySMPCController(Controller):
         self.debug = getattr(config, "debug", True)
 
         # --- MPPI Configuration ---
-        self.H = 10  # Reasonable horizon (0.5s at 50Hz env)
+        self.H = 10 # Reasonable horizon (0.5s at 50Hz env)
         
         # Noise exploration: [roll, pitch, yaw_rate, thrust]
         self.noise_std = jnp.array([0.15, 0.15, 0.30, 0.1])
@@ -181,21 +181,34 @@ class MySMPCController(Controller):
             all_gate_poses.append(gate_pos.copy())
             all_gate_dirs.append(gate_forward.copy())
 
+            # --- ROBUST MACRO-FLOW SIGN CALCULATION ---
+            # Look at previous and next gates to find the true flow vector,
+            # avoiding 90-degree U-turn dot product instability.
             if sequence_idx == 0:
-                reference_point = self.spawn_pos
+                prev_pos = self.spawn_pos[:2]
             else:
                 prev_gate_idx = gate_order[sequence_idx - 1]
-                reference_point = np.array(live_gates_pos[prev_gate_idx], dtype=float)
+                prev_pos = np.array(live_gates_pos[prev_gate_idx][:2], dtype=float)
 
-            arrival_dir = (gate_pos - reference_point)[:2]
-            arrival_norm = np.linalg.norm(arrival_dir)
-            if arrival_norm > 1e-6:
-                arrival_dir = arrival_dir / arrival_norm
+            if sequence_idx < len(gate_order) - 1:
+                next_gate_idx = gate_order[sequence_idx + 1]
+                next_pos = np.array(live_gates_pos[next_gate_idx][:2], dtype=float)
             else:
-                arrival_dir = gate_forward[:2]
+                # Extrapolate flow direction for the final gate
+                curr_pos = gate_pos[:2]
+                next_pos = curr_pos + (curr_pos - prev_pos)
 
-            sign = 1.0 if np.dot(gate_forward[:2], arrival_dir) >= 0.0 else -1.0
-            wp_axis = gate_forward * sign  # unit vector, exactly on the gate's true centerline
+            macro_flow_dir = next_pos - prev_pos
+            macro_flow_norm = np.linalg.norm(macro_flow_dir)
+            
+            if macro_flow_norm > 1e-6:
+                macro_flow_dir = macro_flow_dir / macro_flow_norm
+            else:
+                macro_flow_dir = gate_forward[:2]
+
+            # Compare macro flow to the gate's local X-axis
+            sign = 1.0 if np.dot(gate_forward[:2], macro_flow_dir) >= 0.0 else -1.0
+            wp_axis = gate_forward * sign  # True centerline vector
 
             pre_offset = 0.25
             post_offset = 0.25
@@ -312,7 +325,7 @@ class MySMPCController(Controller):
         xy_dist = jnp.linalg.norm(diff[:2])
         z_dist = jnp.abs(diff[2])
 
-        cost = (xy_dist**2) * 25.0 + (z_dist**2) * 100.0
+        cost = (xy_dist**2) * 50.0 + (z_dist**2) * 100.0
         
        # 2. Cross-Track Error (Virtual Tube)
         rel_pos = pos - target
@@ -321,7 +334,7 @@ class MySMPCController(Controller):
         cross_track_error = jnp.linalg.norm(cross_track_vec)
 
         # Widen the base funnel radius to 0.15m to perfectly encompass the gate hole
-        funnel_radius = 0.15 + jnp.maximum(0.0, -longitudinal_dist) * 1.0
+        funnel_radius = 0.10 + jnp.maximum(0.0, -longitudinal_dist) * 1.0
         
         raw_tube_penalty = jnp.where(
             (cross_track_error > funnel_radius) & (longitudinal_dist < 0.0), 
@@ -331,7 +344,7 @@ class MySMPCController(Controller):
         cost += raw_tube_penalty
         
         # Only pull to centerline if approaching; release the drone once it passes the threshold
-        cost += jnp.where(longitudinal_dist < 0.0, cross_track_error * 25.0, 0.0)
+        cost += jnp.where(longitudinal_dist < 0.0, cross_track_error * 30.0, 0.0)
 
         # 3. GLOBAL STRICT GATE FRAME PENALTY (True SDF Formulation)
         all_gate_poses = params.get("all_gate_poses")
@@ -386,8 +399,8 @@ class MySMPCController(Controller):
             # Penalize if drone center is within 12cm of the PVC pipe. 
             # This leaves a clean, penalty-free 16x16cm square perfectly in the middle.
             frame_collision = jnp.where(
-                sdf < 0.12,
-                (0.12 - sdf) * 100000.0,
+                sdf < 0.15,
+                (0.15 - sdf) * 1000.0,
                 0.0
             )
             cost += jnp.sum(frame_collision)
@@ -398,7 +411,7 @@ class MySMPCController(Controller):
         vel_dir = vel / speed
         target_dir = -diff / (dist_to_target + 1e-5) 
         
-        cost += (1.0 - jnp.dot(vel_dir, target_dir)) * 10.0 * speed
+        cost += (1.0 - jnp.dot(vel_dir, target_dir)) * 15.0 * speed
         cost += (1.0 - jnp.dot(vel_dir, g_dir)) * 8.0 * speed 
         cost += (speed ** 2) * 1.0
 
@@ -411,8 +424,8 @@ class MySMPCController(Controller):
             # Maintained linear gradient for steep repulsion
             repulsion_field = jnp.sum(
                 jnp.where(
-                    dist_to_obs < 0.15, 
-                    (0.15 - dist_to_obs) * 5000.0, 
+                    dist_to_obs < 0.20, 
+                    (0.20 - dist_to_obs) * 250.0, 
                     0.0
                 )
             )
@@ -420,11 +433,11 @@ class MySMPCController(Controller):
         
         # 6. Out-of-Bounds
         oob = (pos[0] < -2.4) | (pos[0] > 2.4) | (pos[1] < -1.4) | (pos[1] > 1.4) | (pos[2] < 0.05) | (pos[2] > 1.95)
-        cost += jnp.where(oob, 500.0, 0.0)
+        cost += jnp.where(oob, 1000.0, 0.0)
 
-        # 7. Actuator Smoothing
-        cost += (action[0]**2 + action[1]**2) * 2.0
-        cost += ((action[3] - params["hover_thrust"]) ** 2) * 2.0
+        # 7. Actuator Smoothin1
+        cost += (action[0]**2 + action[1]**2) * 1.0
+        cost += ((action[3] - params["hover_thrust"]) ** 2) * 1.0
 
         return cost
     
@@ -506,7 +519,7 @@ class MySMPCController(Controller):
             self.dt,
             self.drone_mass,
             self.g,
-            0.08,
+            0.1,
             self.noise_std,
             params,
             dt_pred=self.dt_pred
