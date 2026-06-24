@@ -43,11 +43,6 @@ class MySMPCController(Controller):
         # --- Track Setup ---
         self.obstacles_np = np.array([o["pos"] for o in config.env.track.obstacles])
         self.spawn_pos = np.array(obs["pos"], dtype=float)
-        # Gates only reveal their true (randomized) pose once the drone is within this
-        # range; before that, obs reports the nominal pose. See compute_control's
-        # caution-zone speed cap, which slows the approach so there's more real time to
-        # react once the true pose snaps in.
-        self.sensor_range = float(getattr(config.env, "sensor_range", 0.7))
         
         gates_config = config.env.track.gates
         self.num_gates = len(gates_config)
@@ -57,8 +52,6 @@ class MySMPCController(Controller):
         self.init_gates_rpy = [g["rpy"] for g in gates_config]
 
         self._update_track_geometry(self.init_gates_pos, self.init_gates_rpy, self.obstacles_np)
-        self._cached_gates_pos = np.array(self.init_gates_pos)
-        self._cached_gates_rpy = np.array(self.init_gates_rpy)
 
         self.active_wp_idx = 0
 
@@ -75,30 +68,27 @@ class MySMPCController(Controller):
 
         self.debug = getattr(config, "debug", True)
 
-        self._episode_count = 0
-
         # --- MPPI Configuration ---
-        self.H = 5  # 0.8 s lookahead at dt_pred=0.04
-        self.K = 2000  # Number of parallel trajectory samples
+        self.H = 5 # Reasonable horizon (0.5s at 50Hz env)
+        #self.K = 5000  # Reduced but focused samples
 
         # Noise exploration: [roll, pitch, yaw_rate, thrust]
-        self.noise_std = jnp.array([0.15, 0.15, 0.30, 0.15])
+        self.noise_std = jnp.array([0.15, 0.15, 0.30, 0.1])
 
-        self.engine = build_mppi_solver(self._cost_fn, self._dynamics_fn, K=self.K)
+        self.engine = build_mppi_solver(self._cost_fn, self._dynamics_fn)
 
         # Initialize nominal with gentle forward bias (helps cold start)
         self.nominal_seq = jnp.zeros((self.H, 4))
         self.nominal_seq = self.nominal_seq.at[:, 0].set(0.05)  # Gentle forward tilt
         self.nominal_seq = self.nominal_seq.at[:, 3].set(self.hover_thrust * 1.1)  # Slight lift
         self.rng_key = jax.random.PRNGKey(42)
-        self.last_action = jnp.array([0.0, 0.0, 0.0, self.hover_thrust])
 
         self.planned_trajectory = None
 
     def _update_track_geometry(self, live_gates_pos, live_gates_rpy, live_obstacles):
         """Rebuilds the MPC track geometry based on dynamic sensor observations."""
         self.obstacles_np = np.array(live_obstacles)
-
+        
         waypoints = []
         gate_dirs = []
         all_gate_poses = []
@@ -117,6 +107,7 @@ class MySMPCController(Controller):
             all_gate_poses.append(gate_pos.copy())
             all_gate_dirs.append(forward_dir.copy())
 
+            # Tightened distance to 0.20m so waypoints don't overlap with obstacles
             pre_wp = gate_pos - forward_dir * 0.2
             center_wp = gate_pos.copy()
             post_wp = gate_pos + forward_dir * 0.8
@@ -133,16 +124,7 @@ class MySMPCController(Controller):
 
     @staticmethod
     def _dynamics_fn(state: jnp.ndarray, action: jnp.ndarray, params: dict) -> jnp.ndarray:
-        """Proper kinematic rigid body dynamics with correct physics.
-        
-        Args:
-            state: 9D state [pos_xyz, vel_xyz, rpy]
-            action: 4D action [roll_cmd, pitch_cmd, yaw_rate, thrust]
-            params: dict with dt, dt_pred, mass, g
-            
-        Returns:
-            next_state: 9D state after one timestep
-        """
+        """Proper kinematic rigid body dynamics with correct physics."""
         dt = params.get("dt_pred", params["dt"])
         mass = params["mass"]
         g = params["g"]
@@ -159,7 +141,9 @@ class MySMPCController(Controller):
         cmd_yaw_rate = jnp.clip(action[2], -2.0, 2.0)  # rad/s limit
         cmd_thrust = jnp.clip(action[3], 0.0, mass * g * 2.5)
 
-        roll_rate = (cmd_roll - roll) * 5.0
+        # Attitude rate integration - smoothed transition toward commanded attitude
+        # Instead of instantaneous attitude changes, smooth out the commands
+        roll_rate = (cmd_roll - roll) * 5.0  # Proportional toward command
         pitch_rate = (cmd_pitch - pitch) * 5.0
         yaw_rate = cmd_yaw_rate
 
@@ -184,7 +168,7 @@ class MySMPCController(Controller):
 
         # Gravity and drag
         gravity_acc = jnp.array([0.0, 0.0, -g])
-        drag_coeff = 0.08  # Light aerodynamic drag — prevents runaway speed in rollouts
+        drag_coeff = 0.0  # Reduced from 0.25 for more responsiveness
         drag_acc = -drag_coeff * vel
 
         total_acc = thrust_acc + gravity_acc + drag_acc
@@ -197,26 +181,7 @@ class MySMPCController(Controller):
 
     @staticmethod
     def _cost_fn(state: jnp.ndarray, action: jnp.ndarray, next_state: jnp.ndarray, params: dict) -> jnp.ndarray:
-        """Stage cost metric mapping optimized trajectories.
-        
-        Implements PA-MPPI cost function with:
-        - Positional attraction to target
-        - Cross-track error (funnel constraints)
-        - Gate frame penalties
-        - Velocity alignment
-        - Obstacle avoidance
-        - Arena bounds enforcement
-        - Actuator smoothing
-        
-        Args:
-            state: Current 9D state [pos, vel, rpy]
-            action: Control input [roll, pitch, yaw_rate, thrust]
-            next_state: Next state after dynamics
-            params: Cost parameters dict
-            
-        Returns:
-            Scalar cost value
-        """
+        """Stage cost metric mapping optimized trajectories."""
         pos = next_state[0:3]
         vel = next_state[3:6]
         target = params["target"]
@@ -249,7 +214,7 @@ class MySMPCController(Controller):
         # Prevents the drone from flying too wide
         longitudinal_dist_abs = jnp.abs(longitudinal_dist)
         funnel_radius = 0.10 + (longitudinal_dist_abs * 1.0)
-
+        
         raw_tube_penalty = jnp.where(cross_track_error > funnel_radius, (cross_track_error - funnel_radius) * 5000.0, 0.0)
         #cost += jnp.clip(raw_tube_penalty, 0.0, 400.0) 
         cost += raw_tube_penalty  # No clipping, let the optimizer feel the full gradient to stay in the funnel.\
@@ -285,70 +250,61 @@ class MySMPCController(Controller):
             dy = jnp.sum(rel_poses * g_y, axis=1)
             dz = jnp.sum(rel_poses * g_z, axis=1)
 
-            # --- GATE FRAME COLLISION BARRIER ---
-            # Matches the real MuJoCo collision boxes in envs/assets/gate.xml: a safe
-            # square hole of half-width ~0.20m, frame material from ~0.20-0.36m, and a
-            # paper-thin depth (~0.01m) along the gate normal. The previous formula
-            # multiplied three sub-1 fractional terms together, which structurally
-            # capped its own peak penalty around ~150 regardless of the nominal 250,000
-            # weight — far too weak to discourage an off-center pass (obstacle
-            # hard-crash is 80,000; this is the dominant cause of gate-frame collisions
-            # in evaluation). This barrier scales a single quadratic term directly, so
-            # the weight controls the realized magnitude.
-            safe_half = 0.16  # tighter than the real 0.20m hole: margin for drone body
-            outer_half = 0.40  # a bit past the real 0.36m frame edge
-            thickness = 0.15  # depth margin around the (paper-thin) real frame
-
-            lat_excess = jnp.maximum(jnp.abs(dy) - safe_half, jnp.abs(dz) - safe_half)
-            lat_excess = jnp.maximum(lat_excess, 0.0)
-            in_outer = (jnp.abs(dy) < outer_half) & (jnp.abs(dz) < outer_half)
-            near_plane = jnp.abs(dx) < thickness
-
-            frame_collision = jnp.where(in_outer & near_plane, (lat_excess ** 2) * 100000.0, 0.0)
-
+            # --- NEW CONTINUOUS FRAME PENALTY ---
+            # 1. Thickness: Peaks at 0 inside the plane, scales down to 0 at 0.15m away
+            in_thickness = jnp.maximum(0.0, 0.15 - jnp.abs(dx))
+            
+            # 2. Outer bound: Peaks at center, scales down to 0 at 0.46m (outside the frame)
+            in_outer_y = jnp.maximum(0.0, 0.46 - jnp.abs(dy))
+            in_outer_z = jnp.maximum(0.0, 0.46 - jnp.abs(dz))
+            in_outer = in_outer_y * in_outer_z
+            
+            # 3. Inner Hole: 0 if safely inside the 0.15m hole, scales UP as you move outward
+            out_inner_y = jnp.maximum(0.0, jnp.abs(dy) - 0.15)
+            out_inner_z = jnp.maximum(0.0, jnp.abs(dz) - 0.15)
+            out_inner = out_inner_y + out_inner_z
+            
+            # Multiply them together. This creates a 3D "donut" of penalty.
+            # If it's far away (dx > 0.15), in_thickness is 0 -> No penalty.
+            # If it's far outside (dy > 0.46), in_outer is 0 -> No penalty.
+            # If it's safely in the middle hole (dy,dz < 0.15), out_inner is 0 -> No penalty.
+            # Everywhere else (the frame material), the penalty acts as a steep slope away from the PVC.
+            frame_collision = in_thickness * in_outer * out_inner * 250000.0
+            
             cost += jnp.sum(frame_collision)
         # ---------------------------------------------------------
-        # 4. Velocity — fast in open space, controlled on gate approach
+        # 3. Velocity Alignment & Speed Limit
         speed = jnp.linalg.norm(vel) + 1e-5
         vel_dir = vel / speed
-        target_dir = -diff / (dist_to_target + 1e-5)
-
+        target_dir = -diff / (dist_to_target + 1e-5) 
+       
+        
         cost += (1.0 - jnp.dot(vel_dir, target_dir)) * 10.0 * speed
-        cost += (1.0 - jnp.dot(vel_dir, g_dir)) * 8.0 * speed
-
+        cost += (1.0 - jnp.dot(vel_dir, g_dir)) * 8.0 * speed 
+        
+        
         cost += (speed ** 2) * 3.0
 
-        # Yaw alignment: penalize sideways flight with fixed weight (no speed scaling —
-        # speed-scaled yaw cost causes MPPI to systematically prefer slow trajectories)
-        yaw = next_state[8]
-        vel_xy = vel[:2]
-        speed_xy = jnp.linalg.norm(vel_xy) + 1e-5
-        desired_yaw = jnp.arctan2(vel_xy[1], vel_xy[0])
-        yaw_err = jnp.arctan2(jnp.sin(yaw - desired_yaw), jnp.cos(yaw - desired_yaw))
-        cost += (yaw_err ** 2) * 0.5
-
-        # Next-waypoint lookahead: gently pull toward the waypoint after current target.
-        # This is the key fix for gate transitions (e.g. gate 3 → gate 4 180° turn):
-        # while flying toward gate 3 post_wp, the planner already curves toward gate 4 pre_wp.
-        next_diff = pos - params["next_target"]
-        cost += jnp.linalg.norm(next_diff) * 2.0
-
-
-        # 5. Obstacle Avoidance
-        if obstacles.shape[0] > 0 and obstacles.shape[1] > 0:
+        # 4. Obstacle Avoidance (Dominant Repulsion)
+        if obstacles.shape[0] > 0:
             obs_xy = obstacles[:, :2]
             pos_xy = pos[:2]
             dist_to_obs = jnp.linalg.norm(obs_xy - pos_xy[None, :], axis=1)
-
+            
+            # MASSIVE GRADIENT INCREASE: Bumped from 100.0 to 1500.0.
+            # At 0.40m away, penalty is 0.
+            # At 0.25m away (deep in the bubble), penalty is (0.40 - 0.25) * 1500 = 225.0.
+            # This 225.0 penalty easily overpowers the tube penalty, pushing the drone out of the funnel decisively.
             repulsion_field = jnp.sum(
                 jnp.where(
-                    dist_to_obs < 0.25,
-                    (0.25 - dist_to_obs) ** 2 * 6000.0,
+                    dist_to_obs < 0.20, 
+                    (0.20 - dist_to_obs**2) * 5000.0, 
                     0.0
                 )
             )
-            hard_crash = jnp.sum(jnp.where(dist_to_obs < 0.10, 80000.0, 0.0))
-            cost += repulsion_field + hard_crash
+            
+            hard_crash = jnp.sum(jnp.where(dist_to_obs < 0.05, 50000.0, 0.0))
+            cost += (repulsion_field)
         
         # 6. Out-of-Bounds Arena Guardrail Constraints
         oob = (pos[0] < -2.4) | (pos[0] > 2.4) | (pos[1] < -1.4) | (pos[1] > 1.4) | (pos[2] < 0.05) | (pos[2] > 1.95)
@@ -357,6 +313,7 @@ class MySMPCController(Controller):
         # 7. Actuator Smoothing
         cost += (action[0]**2 + action[1]**2) * 5.0
         cost += ((action[3] - params["hover_thrust"]) ** 2) * 5.0
+
 
         return cost
     
@@ -371,48 +328,27 @@ class MySMPCController(Controller):
 
     def compute_control(self, obs: dict, info: dict | None = None) -> np.ndarray:
         """Main control loop."""
-
-        def _get(key, default):
-            """Safe lookup: obs first, then info, then default."""
-            if key in obs:
-                return obs[key]
-            if info is not None and key in info:
-                return info[key]
-            return default
-
+        
         # 1. --- LIVE SENSOR UPDATE ---
-        live_gates_pos = _get("gates_pos", self.all_gate_poses_jnp)
-
+        live_gates_pos = obs.get("gates_pos", info.get("gates_pos", self.all_gate_poses_jnp))
+        
         # Safely extract orientations: Check for RPY, then Yaw, then fallback to nominal config
         if "gates_rpy" in obs or (info is not None and "gates_rpy" in info):
-            live_gates_rpy = _get("gates_rpy", self.init_gates_rpy)
+            live_gates_rpy = obs.get("gates_rpy", info.get("gates_rpy"))
         elif "gates_yaw" in obs or (info is not None and "gates_yaw" in info):
-            yaws = _get("gates_yaw", None)
+            yaws = obs.get("gates_yaw", info.get("gates_yaw"))
             live_gates_rpy = np.zeros((len(live_gates_pos), 3))
             live_gates_rpy[:, 2] = yaws
         else:
             live_gates_rpy = self.init_gates_rpy
 
-        live_obstacles = _get("obstacles_pos", self.obstacles_np)
-
-        # Only recompute geometry when gate data actually changes (gates are fixed mid-episode)
-        gates_pos_arr = np.array(live_gates_pos)
-        gates_rpy_arr = np.array(live_gates_rpy)
-        if not (np.array_equal(gates_pos_arr, self._cached_gates_pos) and
-                np.array_equal(gates_rpy_arr, self._cached_gates_rpy)):
-            self._update_track_geometry(live_gates_pos, live_gates_rpy, live_obstacles)
-            self._cached_gates_pos = gates_pos_arr
-            self._cached_gates_rpy = gates_rpy_arr
+        live_obstacles = obs.get("obstacles_pos", info.get("obstacles_pos", self.obstacles_np))
+        
+        # Instantly shift the targets and collision hitboxes
+        self._update_track_geometry(live_gates_pos, live_gates_rpy, live_obstacles)
         
         # 2. --- TARGET ACQUISITION ---
         pos = np.array(obs["pos"])
-
-        # Sync waypoint index with env's gate tracker to prevent desync at high speed.
-        env_gate = int(obs.get("target_gate", -1))
-        if env_gate != -1:
-            expected_wp = env_gate * 3
-            if self.active_wp_idx < expected_wp:
-                self.active_wp_idx = expected_wp
 
         # If we've gone through all waypoints, loop back to last one
         if self.active_wp_idx >= len(self.waypoints):
@@ -436,12 +372,6 @@ class MySMPCController(Controller):
             rpy[0], rpy[1], rpy[2]
         ])
 
-        active_gate_idx = self.active_wp_idx // 3
-
-        # Next waypoint for lookahead cost — clamped so last waypoint points to itself
-        next_wp_idx = min(self.active_wp_idx + 1, len(self.waypoints) - 1)
-        next_target = np.array(self.waypoints[next_wp_idx])
-
         # Pack simulation parameters
         params = {
             "dt": self.dt,
@@ -450,20 +380,12 @@ class MySMPCController(Controller):
             "g": self.g,
             "hover_thrust": self.hover_thrust,
             "target": jnp.array(current_target),
-            "next_target": jnp.array(next_target),
             "g_dir": jnp.array(self.gate_dirs[self.active_wp_idx]),
             "obstacles": jnp.array(self.obstacles_np) if len(self.obstacles_np) > 0 else jnp.array([[]]),
-            "active_gate_pos": jnp.array(self.all_gate_poses_jnp[active_gate_idx]),
-            "active_gate_dir": jnp.array(self.all_gate_dirs_jnp[active_gate_idx]),
-            "sensor_range": self.sensor_range,
-
-            # Penalize the active gate's frame plus the one just passed: the env credits a
-            # gate pass as soon as the drone's center crosses the gate plane within bounds,
-            # but the drone's body can still be clearing the frame edge for a few more cm —
-            # dropping the just-passed gate's frame penalty at that exact moment leaves a
-            # window where nothing discourages grazing it on the way out.
-            "all_gate_poses": self.all_gate_poses_jnp[max(0, active_gate_idx - 1):active_gate_idx + 1],
-            "all_gate_dirs": self.all_gate_dirs_jnp[max(0, active_gate_idx - 1):active_gate_idx + 1],
+           
+            # --- NEW LINES ---
+            "all_gate_poses": self.all_gate_poses_jnp,
+            "all_gate_dirs": self.all_gate_dirs_jnp
         }
 
         # MPPI optimization
@@ -478,21 +400,20 @@ class MySMPCController(Controller):
             self.dt,
             self.drone_mass,
             self.g,
-            0.08,             # lambda
+            0.08,             # lambda_
             self.noise_std,
             params,           # <--- SEE CRITICAL WARNING BELOW
             dt_pred=self.dt_pred
         )
 
         action = optimal_action
-        self.last_action = optimal_action
 
        # Calculate visualization trajectory using the newly updated nominal sequence
         pos_seq = self._rollout_traj(current_state, self.nominal_seq, params)
         self.planned_trajectory = np.array(jax.device_get(pos_seq))
 
-        # Saturate actions — bounds must match engine lower_bound/upper_bound
-        min_action = jnp.array([-0.5, -0.5, -2.0, self.drone_mass * self.g * 0.5])
+        # Saturate actions
+        min_action = jnp.array([-0.5, -0.5, -2.0, 0.0])
         max_action = jnp.array([0.5, 0.5, 2.0, self.drone_mass * self.g * 2.5])
         action = jnp.clip(action, min_action, max_action)
 
@@ -569,15 +490,12 @@ class MySMPCController(Controller):
         return self._finished
 
     def episode_callback(self):
-        self._episode_count += 1
         self._tick = 0
         self._finished = False
         self.active_wp_idx = 0
         self.nominal_seq = jnp.zeros((self.H, 4))
         self.nominal_seq = self.nominal_seq.at[:, 3].set(self.hover_thrust)
-        # Use a different seed each episode so the 20 evaluation runs explore different trajectories
-        self.rng_key = jax.random.PRNGKey(self._episode_count)
-        self.last_action = jnp.array([0.0, 0.0, 0.0, self.hover_thrust])
+        self.rng_key = jax.random.PRNGKey(42)
 
     def _print_debug(self, obs, target_np, traj_costs, action):
         """Log debug information."""
