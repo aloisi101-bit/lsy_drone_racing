@@ -77,7 +77,7 @@ class MySMPCController(Controller):
 
         # --- MPPI Configuration ---
         self.H = 10 # Reasonable horizon (0.5s at 50Hz env)
-        self.temperature = 0.05 # Lower temperature for sharper selection of low-cost trajectories
+        self.temperature = 0.08 # Lower temperature for sharper selection of low-cost trajectories
         
         # Noise exploration: [roll, pitch, yaw_rate, thrust]
         self.noise_std = jnp.array([0.15, 0.15, 0.30, 0.1])
