@@ -72,6 +72,7 @@ class MySMPCController(Controller):
 
         # --- MPPI Configuration ---
         self.H = 10 # Reasonable horizon (0.5s at 50Hz env)
+        self.temperature = 0.08 # Lower temperature for sharper selection of low-cost trajectories
         
         # Noise exploration: [roll, pitch, yaw_rate, thrust]
         self.noise_std = jnp.array([0.15, 0.15, 0.30, 0.1])
@@ -80,8 +81,8 @@ class MySMPCController(Controller):
 
         # Initialize nominal with gentle forward bias (helps cold start)
         self.nominal_seq = jnp.zeros((self.H, 4))
-        self.nominal_seq = self.nominal_seq.at[:, 0].set(0.05)  # Gentle forward tilt
-        self.nominal_seq = self.nominal_seq.at[:, 3].set(self.hover_thrust * 1.1)  # Slight lift
+        self.nominal_seq = self.nominal_seq.at[:, 0].set(0.01)  # Gentle forward tilt
+        self.nominal_seq = self.nominal_seq.at[:, 3].set(self.hover_thrust * 1.5)  # Slight lift
         self.rng_key = jax.random.PRNGKey(42)
 
         self.planned_trajectory = None
@@ -109,8 +110,8 @@ class MySMPCController(Controller):
                 obs_xy = np.array(obs_pos[:2])
                 dist = np.linalg.norm(point_xy - obs_xy)
                 
-                # 0.30m is a safe bubble radius (obstacle=0.015m, drone=~0.1m + buffer)
-                if dist < 0.30:
+                # 0.50m is a safe bubble radius (obstacle=0.015m, drone=~0.1m + buffer)
+                if dist < 0.50:
                     conflict = True
                     push_dir = point_xy - obs_xy
                     norm = np.linalg.norm(push_dir)
@@ -124,7 +125,7 @@ class MySMPCController(Controller):
                         
                     push_dir = push_dir / norm
                     # Push waypoint outwards to be exactly 0.23m away from obstacle center
-                    shifted[:2] = obs_xy + push_dir * 0.23
+                    shifted[:2] = obs_xy + push_dir * 0.20
             
             if not conflict:
                 break
@@ -182,8 +183,9 @@ class MySMPCController(Controller):
             all_gate_dirs.append(gate_forward.copy())
 
             # --- ROBUST MACRO-FLOW SIGN CALCULATION ---
-            # Look at previous and next gates to find the true flow vector,
-            # avoiding 90-degree U-turn dot product instability.
+            # Use normalized approach vector + heavily down-weighted exit vector.
+            # This ensures the funnel ALWAYS faces the incoming drone (even on 180-deg U-turns)
+            # while still breaking dot-product instability on exact 90-degree turns.
             if sequence_idx == 0:
                 prev_pos = self.spawn_pos[:2]
             else:
@@ -194,11 +196,27 @@ class MySMPCController(Controller):
                 next_gate_idx = gate_order[sequence_idx + 1]
                 next_pos = np.array(live_gates_pos[next_gate_idx][:2], dtype=float)
             else:
-                # Extrapolate flow direction for the final gate
                 curr_pos = gate_pos[:2]
                 next_pos = curr_pos + (curr_pos - prev_pos)
 
-            macro_flow_dir = next_pos - prev_pos
+            # 1. Normalized Approach Vector
+            approach_vec = gate_pos[:2] - prev_pos
+            app_norm = np.linalg.norm(approach_vec)
+            if app_norm > 1e-6:
+                approach_vec = approach_vec / app_norm
+            else:
+                approach_vec = gate_forward[:2]
+
+            # 2. Normalized Exit Vector
+            exit_vec = next_pos - gate_pos[:2]
+            ext_norm = np.linalg.norm(exit_vec)
+            if ext_norm > 1e-6:
+                exit_vec = exit_vec / ext_norm
+            else:
+                exit_vec = gate_forward[:2]
+            
+            # Combine: Approach dominates entirely, Exit vector only tips the scale on a 90-deg tie
+            macro_flow_dir = approach_vec + 0.1 * exit_vec
             macro_flow_norm = np.linalg.norm(macro_flow_dir)
             
             if macro_flow_norm > 1e-6:
@@ -210,8 +228,8 @@ class MySMPCController(Controller):
             sign = 1.0 if np.dot(gate_forward[:2], macro_flow_dir) >= 0.0 else -1.0
             wp_axis = gate_forward * sign  # True centerline vector
 
-            pre_offset = 0.25
-            post_offset = 0.25
+            pre_offset = 0.40
+            post_offset = 0.40
             
             pre_wp = gate_pos - wp_axis * pre_offset
             center_wp = gate_pos.copy()
@@ -320,33 +338,32 @@ class MySMPCController(Controller):
         obstacles = params["obstacles"]
 
         # 1. Positional Attraction Cost
+        # Strong pull to target, heavily weighted in Z to fight Level 3 gravity/downdrafts
         diff = pos - target
         dist_to_target = jnp.linalg.norm(diff)
         xy_dist = jnp.linalg.norm(diff[:2])
         z_dist = jnp.abs(diff[2])
 
-        cost = (xy_dist**2) * 50.0 + (z_dist**2) * 100.0
+        cost = (xy_dist**2) * 60.0 + (z_dist**2) * 100.0
         
-       # 2. Cross-Track Error (Virtual Tube)
+        # 2. Cross-Track Error (Virtual Tube)
         rel_pos = pos - target
         longitudinal_dist = jnp.dot(rel_pos, g_dir)
         cross_track_vec = rel_pos - (longitudinal_dist * g_dir)
         cross_track_error = jnp.linalg.norm(cross_track_vec)
 
-        # Widen the base funnel radius to 0.15m to perfectly encompass the gate hole
         funnel_radius = 0.10 + jnp.maximum(0.0, -longitudinal_dist) * 1.0
         
         raw_tube_penalty = jnp.where(
             (cross_track_error > funnel_radius) & (longitudinal_dist < 0.0), 
-            (cross_track_error - funnel_radius) * 500.0, 
+            (cross_track_error - funnel_radius) * 50.0, 
             0.0
         )
         cost += raw_tube_penalty
         
-        # Only pull to centerline if approaching; release the drone once it passes the threshold
-        cost += jnp.where(longitudinal_dist < 0.0, cross_track_error * 30.0, 0.0)
+        cost += jnp.where(longitudinal_dist < 0.0, cross_track_error  * 100.0, 0.0)
 
-        # 3. GLOBAL STRICT GATE FRAME PENALTY (True SDF Formulation)
+        # 3. GLOBAL STRICT GATE FRAME & STAND PENALTY (True SDF Formulation)
         all_gate_poses = params.get("all_gate_poses")
         all_gate_dirs = params.get("all_gate_dirs")
 
@@ -369,13 +386,6 @@ class MySMPCController(Controller):
             dx = jnp.sum(rel_poses * all_gate_dirs, axis=1)
             dy = jnp.sum(rel_poses * g_y, axis=1)
             dz = jnp.sum(rel_poses * g_z, axis=1)
-
-            # --- PRECISE GATE GEOMETRY FROM gate.xml ---
-            # Physical opening is 0.40m wide (inner bounds: 0.20m from center)
-            # Outer frame is 0.72m wide (outer bounds: 0.36m from center)
-            # Center of the PVC pipe ring is (0.20 + 0.36) / 2 = 0.28m
-            # Half-thickness of the PVC pipe is (0.36 - 0.20) / 2 = 0.08m
-            # X-depth (thickness of gate) is roughly 0.10m total (0.05m from center)
             
             max_yz = jnp.maximum(jnp.abs(dy), jnp.abs(dz))
             
@@ -385,7 +395,6 @@ class MySMPCController(Controller):
             
             ext_dist = jnp.sqrt(d_yz**2 + d_x**2 + 1e-8)
             
-            # Depth inside the material (if physical collision has occurred)
             depth_yz = 0.08 - jnp.abs(max_yz - 0.28)
             depth_x = 0.05 - jnp.abs(dx)
             interior_depth = jnp.minimum(depth_yz, depth_x)
@@ -396,24 +405,37 @@ class MySMPCController(Controller):
                 ext_dist
             )
             
-            # Penalize if drone center is within 12cm of the PVC pipe. 
-            # This leaves a clean, penalty-free 16x16cm square perfectly in the middle.
             frame_collision = jnp.where(
-                sdf < 0.15,
-                (0.15 - sdf) * 1000.0,
+                sdf < 0.10,
+                (0.10 - sdf) * 100000.0,
                 0.0
             )
             cost += jnp.sum(frame_collision)
 
+            # GATE STAND PENALTY (With Vertical Escape Gradient)
+            dist_to_stand_xy = jnp.linalg.norm(pos[:2][None, :] - all_gate_poses[:, :2], axis=1)
+            depth_below_gate = jnp.maximum(0.0, (all_gate_poses[:, 2] - 0.15) - pos[2])
+            
+            stand_collision = jnp.where(
+                (depth_below_gate > 0.0) & (dist_to_stand_xy < 0.20),
+                (0.20 - dist_to_stand_xy) * 1000.0 + (depth_below_gate * 500.0),
+                0.0
+            )
+            cost += jnp.sum(stand_collision)
 
         # 4. Velocity Alignment & Speed Limit
         speed = jnp.linalg.norm(vel) + 1e-5
         vel_dir = vel / speed
         target_dir = -diff / (dist_to_target + 1e-5) 
+               
+        # Multiply the target_dir penalty by the fade multiplier
+        cost += (1.0 - jnp.dot(vel_dir, target_dir)) * 12.0 * speed 
         
-        cost += (1.0 - jnp.dot(vel_dir, target_dir)) * 15.0 * speed
+        # The g_dir penalty remains fully active to keep the drone pointing forward 
         cost += (1.0 - jnp.dot(vel_dir, g_dir)) * 8.0 * speed 
-        cost += (speed ** 2) * 1.0
+        
+        # Allow the drone to fly fast without huge penalties
+        cost += (speed ** 2) * 0.15
 
         # 5. Obstacle Avoidance
         if obstacles.shape[0] > 0:
@@ -421,11 +443,11 @@ class MySMPCController(Controller):
             pos_xy = pos[:2]
             dist_to_obs = jnp.linalg.norm(obs_xy - pos_xy[None, :], axis=1)
             
-            # Maintained linear gradient for steep repulsion
+          
             repulsion_field = jnp.sum(
                 jnp.where(
-                    dist_to_obs < 0.20, 
-                    (0.20 - dist_to_obs) * 250.0, 
+                    dist_to_obs < 0.15, 
+                    (0.15 - dist_to_obs) * 500.0, 
                     0.0
                 )
             )
@@ -433,11 +455,12 @@ class MySMPCController(Controller):
         
         # 6. Out-of-Bounds
         oob = (pos[0] < -2.4) | (pos[0] > 2.4) | (pos[1] < -1.4) | (pos[1] > 1.4) | (pos[2] < 0.05) | (pos[2] > 1.95)
-        cost += jnp.where(oob, 1000.0, 0.0)
+        cost += jnp.where(oob, 100000.0, 0.0)
 
-        # 7. Actuator Smoothin1
-        cost += (action[0]**2 + action[1]**2) * 1.0
-        cost += ((action[3] - params["hover_thrust"]) ** 2) * 1.0
+        # 7. Actuator Smoothing
+        cost += (action[0]**2 + action[1]**2) * 0.5    
+        cost += (action[2]**2) * 2.0                  
+        cost += (action[3]** 2) * 0.1
 
         return cost
     
@@ -485,7 +508,7 @@ class MySMPCController(Controller):
         vec_to_target = current_target - pos
         dist_to_wp = np.linalg.norm(vec_to_target)
 
-        if dist_to_wp < 0.25 and self.active_wp_idx < len(self.waypoints) - 1:
+        if dist_to_wp < 0.20 and self.active_wp_idx < len(self.waypoints) - 1:
             self.active_wp_idx += 1
             current_target = np.array(self.waypoints[self.active_wp_idx])
 
@@ -496,6 +519,7 @@ class MySMPCController(Controller):
             rpy[0], rpy[1], rpy[2]
         ])
 
+        
         params = {
             "dt": self.dt,
             "dt_pred": self.dt_pred,
@@ -519,7 +543,7 @@ class MySMPCController(Controller):
             self.dt,
             self.drone_mass,
             self.g,
-            0.1,
+            self.temperature,
             self.noise_std,
             params,
             dt_pred=self.dt_pred
@@ -596,6 +620,7 @@ class MySMPCController(Controller):
         self._tick = 0
         self._finished = False
         self.active_wp_idx = 0
+        self.thrust_integrator = 0.0
         self.nominal_seq = jnp.zeros((self.H, 4))
         self.nominal_seq = self.nominal_seq.at[:, 3].set(self.hover_thrust)
         self.rng_key = jax.random.PRNGKey(42)
