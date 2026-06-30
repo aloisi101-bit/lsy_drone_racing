@@ -223,29 +223,30 @@ def build_random_track_fn(
         Returns:
             ``(gates_pos (N, 3), gates_quat (N, 4), obstacles_pos (N, 3))``.
         """
-        k_start, *sub_keys = jax.random.split(key, 1 + 3 * N)
-        k_gates = jp.array(sub_keys[:N])
-        k_yaws = jp.array(sub_keys[N : 2 * N])
-        k_obs = jp.array(sub_keys[2 * N :])
+        keys = jax.random.split(key, 3 * N)
+        k_gates, k_yaws, k_obs = keys[:N], keys[N : 2 * N], keys[2 * N :]
+        prev_xy = drone_pos[:2]
+        gate_clear = obs_clear = _clearance(prev_xy, drone_excl_r)
+        no_preference = jp.ones((grid_h, grid_w), jp.float32)
 
-        start_xy = jax.random.uniform(
-            k_start,
-            (2,),
-            minval=jp.array([xmin - border_margin, ymin - border_margin]),
-            maxval=jp.array([xmax + border_margin, ymax + border_margin]),
-        )
-        start_excl = _excl_circle(start_xy, start_excl_r)
+        gates, obstacles = [], []
+        for i in range(N):  # N is usually small, so this unrolled loop instead of scan is fine.
+            gate_xy = _sample(gate_clear, no_preference, k_gates[i])
+            travel = gate_xy - prev_xy
+            yaw = jax.random.uniform(k_yaws[i], minval=-yaw_range, maxval=yaw_range)
+            yaw = (yaw + jp.arctan2(travel[1], travel[0])) % (2 * jp.pi)
+            gates.append(jp.array([gate_xy[0], gate_xy[1], yaw]))
+            gate_clear = jp.minimum(gate_clear, _clearance(gate_xy, gate_excl_r))
+            obs_clear = jp.minimum(obs_clear, _clearance(gate_xy, obstacle_excl_r))
 
-        ones = jp.ones((grid_h, grid_w), jp.float32)
-        init = (
-            start_excl,  # gate placement weight
-            ones,  # cumulative gate exclusion (gate-to-gate)
-            ones,  # cumulative gate exclusion (gate-to-obstacle)
-            ones,  # cumulative obstacle exclusion
-            jp.zeros((N, 3), jp.float32),  # placed gates: [x, y, yaw]
-            jp.zeros((N, 2), jp.float32),  # placed obstacles: [x, y]
-        )
+            corridor = _corridor(prev_xy, gate_xy, obstacle_corridor_width)
+            obs_xy = _sample(obs_clear, corridor, k_obs[i])
+            obstacles.append(obs_xy)
+            gate_clear = jp.minimum(gate_clear, _clearance(obs_xy, obstacle_excl_r))
+            obs_clear = jp.minimum(obs_clear, _clearance(obs_xy, obstacle_obstacle_excl_r))
+            prev_xy = gate_xy
 
+<<<<<<< HEAD
         def place_one(
             carry: tuple[Array, Array, Array, Array, Array, Array], i: int
         ) -> tuple[tuple[Array, Array, Array, Array, Array, Array], None]:
@@ -289,6 +290,9 @@ def build_random_track_fn(
         (_, _, _, _, gates, obstacles), _ = jax.lax.scan(place_one, init, jp.arange(N))
 
         # Assemble output arrays with correct z-heights.
+=======
+        gates, obstacles = jp.stack(gates), jp.stack(obstacles)
+>>>>>>> cf72371 (Fix random track generation for config level 3 (#112))
         gates_pos = jp.concatenate([gates[:, :2], gates_z[:, None]], axis=-1)
         half_yaw = gates[:, 2] / 2.0
         zeros = jp.zeros_like(half_yaw)
