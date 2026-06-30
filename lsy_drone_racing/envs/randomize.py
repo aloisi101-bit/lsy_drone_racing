@@ -247,6 +247,7 @@ def build_random_track_fn(
             prev_xy = gate_xy
 
 <<<<<<< HEAD
+<<<<<<< HEAD
         def place_one(
             carry: tuple[Array, Array, Array, Array, Array, Array], i: int
         ) -> tuple[tuple[Array, Array, Array, Array, Array, Array], None]:
@@ -290,6 +291,9 @@ def build_random_track_fn(
         (_, _, _, _, gates, obstacles), _ = jax.lax.scan(place_one, init, jp.arange(N))
 
         # Assemble output arrays with correct z-heights.
+=======
+        gates, obstacles = jp.stack(gates), jp.stack(obstacles)
+>>>>>>> cf72371 (Fix random track generation for config level 3 (#112))
 =======
         gates, obstacles = jp.stack(gates), jp.stack(obstacles)
 >>>>>>> cf72371 (Fix random track generation for config level 3 (#112))
