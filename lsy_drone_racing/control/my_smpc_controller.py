@@ -182,51 +182,14 @@ class MySMPCController(Controller):
             all_gate_poses.append(gate_pos.copy())
             all_gate_dirs.append(gate_forward.copy())
 
-            # --- ROBUST MACRO-FLOW SIGN CALCULATION ---
-            # Use normalized approach vector + heavily down-weighted exit vector.
-            # This ensures the funnel ALWAYS faces the incoming drone (even on 180-deg U-turns)
-            # while still breaking dot-product instability on exact 90-degree turns.
-            if sequence_idx == 0:
-                prev_pos = self.spawn_pos[:2]
-            else:
-                prev_gate_idx = gate_order[sequence_idx - 1]
-                prev_pos = np.array(live_gates_pos[prev_gate_idx][:2], dtype=float)
-
-            if sequence_idx < len(gate_order) - 1:
-                next_gate_idx = gate_order[sequence_idx + 1]
-                next_pos = np.array(live_gates_pos[next_gate_idx][:2], dtype=float)
-            else:
-                curr_pos = gate_pos[:2]
-                next_pos = curr_pos + (curr_pos - prev_pos)
-
-            # 1. Normalized Approach Vector
-            approach_vec = gate_pos[:2] - prev_pos
-            app_norm = np.linalg.norm(approach_vec)
-            if app_norm > 1e-6:
-                approach_vec = approach_vec / app_norm
-            else:
-                approach_vec = gate_forward[:2]
-
-            # 2. Normalized Exit Vector
-            exit_vec = next_pos - gate_pos[:2]
-            ext_norm = np.linalg.norm(exit_vec)
-            if ext_norm > 1e-6:
-                exit_vec = exit_vec / ext_norm
-            else:
-                exit_vec = gate_forward[:2]
-            
-            # Combine: Approach dominates entirely, Exit vector only tips the scale on a 90-deg tie
-            macro_flow_dir = approach_vec + 0.1 * exit_vec
-            macro_flow_norm = np.linalg.norm(macro_flow_dir)
-            
-            if macro_flow_norm > 1e-6:
-                macro_flow_dir = macro_flow_dir / macro_flow_norm
-            else:
-                macro_flow_dir = gate_forward[:2]
-
-            # Compare macro flow to the gate's local X-axis
-            sign = 1.0 if np.dot(gate_forward[:2], macro_flow_dir) >= 0.0 else -1.0
-            wp_axis = gate_forward * sign  # True centerline vector
+            # --- FIXED TRAVERSAL DIRECTION: gate local +x ---
+            # The environment only credits a gate pass when the drone crosses from the gate's
+            # local -x to +x (see envs/utils.gate_passed: "Gates have to be crossed in the
+            # direction of the x-Axis (pointing from -x to +x)"). So the through-axis is always
+            # the gate's forward normal, NOT a flow-dependent sign. This guarantees the pre
+            # waypoint sits on the -x side and the post waypoint on the +x side, so the drone
+            # always flies through in the +x direction that the env requires.
+            wp_axis = gate_forward  # traversal direction: gate local +x
 
             pre_offset = 0.40
             post_offset = 0.40
