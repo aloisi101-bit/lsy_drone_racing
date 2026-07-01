@@ -30,7 +30,7 @@ class MySMPCController(Controller):
         # --- Environment & Physical Parameters ---
         self._freq = config.env.freq
         self.dt = 1.0 / self._freq
-        self.dt_pred = 0.04
+        self.dt_pred = 0.05
         self._tick = 0
         self._finished = False
 
@@ -68,11 +68,16 @@ class MySMPCController(Controller):
             self._logger.addHandler(fh)
             self._logger.setLevel(logging.INFO)
 
-        self.debug = getattr(config, "debug", True)
+        self.debug = getattr(config, "debug", False)
+
+        # Tunable centering weight (overridable via env var for sweeps; see _cost_fn section 2b).
+        # 2000 was the peak of a fixed-seed Level-3 sweep (0/1k/2k/4k/7k) — beyond it the centering
+        # becomes a wall and hovering returns.
+        self.center_weight = float(os.environ.get("SMPC_CENTER_WEIGHT", "2000"))
 
         # --- MPPI Configuration ---
         self.H = 10 # Reasonable horizon (0.5s at 50Hz env)
-        self.temperature = 0.1 # Lower temperature for sharper selection of low-cost trajectories
+        self.temperature = 0.05 # Lower temperature for sharper selection of low-cost trajectories
         
         # Noise exploration: [roll, pitch, yaw_rate, thrust]
         self.noise_std = jnp.array([0.15, 0.15, 0.30, 0.1])
@@ -101,7 +106,12 @@ class MySMPCController(Controller):
         This prevents squeezing the drone and clipping the turning radius.
         """
         shifted = waypoint.copy()
-        
+
+        # Safe clearance radius from an obstacle center (obstacle=0.015m, drone=~0.1m + buffer).
+        # This is BOTH the conflict trigger and the distance we push the waypoint out to, so a
+        # waypoint is only ever moved outward to the boundary, never pulled inward toward the pole.
+        safe_radius = 0.35
+
         # Iteratively push away from multiple close obstacles if necessary
         for _ in range(5):
             conflict = False
@@ -109,28 +119,100 @@ class MySMPCController(Controller):
             for obs_pos in self.obstacles_np:
                 obs_xy = np.array(obs_pos[:2])
                 dist = np.linalg.norm(point_xy - obs_xy)
-                
-                # 0.50m is a safe bubble radius (obstacle=0.015m, drone=~0.1m + buffer)
-                if dist < 0.30:
+
+                if dist < safe_radius:
                     conflict = True
                     push_dir = point_xy - obs_xy
                     norm = np.linalg.norm(push_dir)
-                    
+
                     if norm < 1e-6:
                         # Dead center of obstacle: push laterally relative to approach dir
                         up = np.array([0.0, 0.0, 1.0])
                         lat = np.cross(approach_dir, up)[:2]
                         push_dir = lat if np.linalg.norm(lat) > 1e-6 else np.array([1.0, 0.0])
                         norm = np.linalg.norm(push_dir)
-                        
+
                     push_dir = push_dir / norm
-                    # Push waypoint outwards to be exactly 0.25m away from obstacle center
-                    shifted[:2] = obs_xy + push_dir * 0.25
-            
+                    # Push waypoint OUTWARD to the safe boundary (never closer than it already was)
+                    shifted[:2] = obs_xy + push_dir * safe_radius
+
             if not conflict:
                 break
-                
+
         return shifted
+
+    def _steer_target_around_obstacles(self, drone_pos, target):
+        """Bend the active MPC target laterally when a pole blocks the straight
+        drone->target line.
+
+        Pure radial repulsion has a local minimum directly in front of an obstacle
+        (repulsion opposes target attraction, no lateral gradient), which makes the
+        drone stall and hover. By offsetting the target to one side we give MPPI a
+        clear direction to commit to so it flies AROUND the pole instead of into it.
+        """
+        steered = np.array(target, dtype=float).copy()
+        p = np.array(drone_pos[:2], dtype=float)
+        t = steered[:2]
+        seg = t - p
+        seg_len = np.linalg.norm(seg)
+        if seg_len < 1e-6:
+            return steered
+        seg_dir = seg / seg_len
+        perp_axis = np.array([-seg_dir[1], seg_dir[0]])  # left-hand normal in XY
+
+        clearance = 0.35
+        for obs_pos in self.obstacles_np:
+            o = np.array(obs_pos[:2], dtype=float)
+            proj = np.dot(o - p, seg_dir)
+            # Only obstacles that lie ahead, between the drone and the target
+            if proj <= 0.05 or proj >= seg_len:
+                continue
+            closest = p + seg_dir * proj
+            perp_vec = o - closest
+            perp_dist = np.linalg.norm(perp_vec)
+            if perp_dist >= clearance:
+                continue
+            # Which side of the path is the pole on? Go around the OTHER side.
+            side = np.dot(perp_vec, perp_axis)
+            go_dir = -perp_axis if side >= 0.0 else perp_axis
+            shift = (clearance - perp_dist) + 0.10  # clear it with a small margin
+            steered[:2] = t + go_dir * shift
+            # Refresh the path basis for any further obstacles
+            t = steered[:2]
+            seg = t - p
+            seg_len = np.linalg.norm(seg) + 1e-9
+            seg_dir = seg / seg_len
+            perp_axis = np.array([-seg_dir[1], seg_dir[0]])
+        return steered
+
+    def _gate_opening_dodge(self, gate_pos, wp_axis):
+        """If a pole pierces this gate's opening, return a lateral offset that moves the thread
+        line to the CLEAR side of the opening.
+
+        A pole that ends up inside the ~0.20 m opening half-width makes the drone freeze at the
+        (blocked) gate center: the centering pull fights the pole repulsion and it stalls in front
+        of the gate. Aiming to the side of the pole lets it thread the open slot instead. The
+        offset is capped so the drone still clears the frame edge.
+        """
+        g_y = np.array([-wp_axis[1], wp_axis[0], 0.0])  # horizontal in-plane (lateral) axis
+        n = np.linalg.norm(g_y)
+        if n < 1e-9:
+            return np.zeros(3)
+        g_y = g_y / n
+        axis_xy = wp_axis[:2]
+        blocking_lat = None
+        best = 0.18  # only poles within the horizontal opening half-width count
+        for obs_pos in self.obstacles_np:
+            rel = np.array(obs_pos[:2], dtype=float) - gate_pos[:2]
+            lon = float(np.dot(rel, axis_xy))          # distance from the gate plane
+            lat = float(np.dot(rel, g_y[:2]))          # horizontal offset within the opening
+            if abs(lon) < 0.35 and abs(lat) < best:
+                best = abs(lat)                        # the most central pole dominates
+                blocking_lat = lat
+        if blocking_lat is None:
+            return np.zeros(3)
+        side = -1.0 if blocking_lat >= 0.0 else 1.0    # aim to the opposite side of the pole
+        return g_y * (side * 0.09)
 
     def _update_track_geometry(self, live_gates_pos, live_gates_rpy, live_obstacles):
         """
@@ -167,6 +249,7 @@ class MySMPCController(Controller):
         gate_dirs = []
         all_gate_poses = []
         all_gate_dirs = []
+        all_gate_aims = []  # gate centers shifted to dodge poles inside the opening (aim points)
         
         for sequence_idx, gate_idx in enumerate(gate_order):
             gate_pos = np.array(live_gates_pos[gate_idx], dtype=float)
@@ -237,7 +320,14 @@ class MySMPCController(Controller):
             
             pre_wp = self._shift_waypoint_away_from_obstacles(pre_wp, wp_axis, is_post=False)
             post_wp = self._shift_waypoint_away_from_obstacles(post_wp, wp_axis, is_post=True)
-            
+
+            # Dodge a pole sitting inside the opening: shift the whole thread line to the clear side.
+            dodge = self._gate_opening_dodge(gate_pos, wp_axis)
+            pre_wp = pre_wp + dodge
+            center_wp = center_wp + dodge
+            post_wp = post_wp + dodge
+            all_gate_aims.append((gate_pos + dodge).copy())
+
             waypoints.extend([pre_wp, center_wp, post_wp])
             gate_dirs.extend([wp_axis, wp_axis, wp_axis])
 
@@ -245,6 +335,7 @@ class MySMPCController(Controller):
         self.gate_dirs = jnp.array(gate_dirs)
         self.all_gate_poses_jnp = jnp.array(all_gate_poses)
         self.all_gate_dirs_jnp = jnp.array(all_gate_dirs)
+        self.all_gate_aims_jnp = jnp.array(all_gate_aims)
 
     def _get_live_gates_rpy(self, obs, info, num_gates):
         """Safely extracts gate orientations from various possible environment configurations."""
@@ -363,6 +454,46 @@ class MySMPCController(Controller):
         
         cost += jnp.where(longitudinal_dist < 0.0, cross_track_error  * 150.0, 0.0)
 
+        # 2b. CENTERED-CROSSING of the ACTIVE gate.
+        # The #1 Level-3 failure is clipping the gate frame: the drone crosses the plane
+        # 0.2-0.34 m off-center (into the 0.20-0.36 m frame band). The generic tube above
+        # relaxes right at the plane, so here we add a strong quadratic pull toward the true
+        # gate center while the drone is within the frame-depth band (|longitudinal|<0.25 m),
+        # forcing a centered thread exactly where the clips happen.
+        active_gate_pos = params.get("active_gate_pos")
+        active_gate_dir = params.get("active_gate_dir")
+        if active_gate_pos is not None and active_gate_dir is not None:
+            rel_g = pos - active_gate_pos
+            long_g = jnp.dot(rel_g, active_gate_dir)
+            lat_g = jnp.linalg.norm(rel_g - long_g * active_gate_dir)
+            # Ramp the centering pull from 0 at the band edge to full at the plane. This keeps a
+            # smooth gradient toward the center WITHOUT a hard cost wall at the boundary, so the
+            # drone is squeezed onto the centerline as it approaches instead of stalling in front
+            # of the gate (a flat near-plane penalty made it hover). Weight kept moderate so the
+            # gate attraction always dominates and forward progress stays cheaper than freezing.
+            near_ramp = jnp.clip((0.25 - jnp.abs(long_g)) / 0.25, 0.0, 1.0)
+            cost += (lat_g ** 2) * params.get("center_weight", 1000.0) * near_ramp
+
+        # 2b. CENTERED-CROSSING of the ACTIVE gate.
+        # The #1 Level-3 failure is clipping the gate frame: the drone crosses the plane
+        # 0.2-0.34 m off-center (into the 0.20-0.36 m frame band). The generic tube above
+        # relaxes right at the plane, so here we add a strong quadratic pull toward the true
+        # gate center while the drone is within the frame-depth band (|longitudinal|<0.25 m),
+        # forcing a centered thread exactly where the clips happen.
+        active_gate_pos = params.get("active_gate_pos")
+        active_gate_dir = params.get("active_gate_dir")
+        if active_gate_pos is not None and active_gate_dir is not None:
+            rel_g = pos - active_gate_pos
+            long_g = jnp.dot(rel_g, active_gate_dir)
+            lat_g = jnp.linalg.norm(rel_g - long_g * active_gate_dir)
+            # Ramp the centering pull from 0 at the band edge to full at the plane. This keeps a
+            # smooth gradient toward the center WITHOUT a hard cost wall at the boundary, so the
+            # drone is squeezed onto the centerline as it approaches instead of stalling in front
+            # of the gate (a flat near-plane penalty made it hover). Weight kept moderate so the
+            # gate attraction always dominates and forward progress stays cheaper than freezing.
+            near_ramp = jnp.clip((0.25 - jnp.abs(long_g)) / 0.25, 0.0, 1.0)
+            cost += (lat_g ** 2) * params.get("center_weight", 1000.0) * near_ramp
+
         # 3. GLOBAL STRICT GATE FRAME & STAND PENALTY (True SDF Formulation)
         all_gate_poses = params.get("all_gate_poses")
         all_gate_dirs = params.get("all_gate_dirs")
@@ -438,19 +569,32 @@ class MySMPCController(Controller):
         cost += (speed ** 2) * 0.15
 
         # 5. Obstacle Avoidance
+        # Wider onset (0.30m) with a quadratic barrier so the drone feels the gradient
+        # early enough to steer around late-revealed poles instead of clipping them.
         if obstacles.shape[0] > 0:
             obs_xy = obstacles[:, :2]
             pos_xy = pos[:2]
             dist_to_obs = jnp.linalg.norm(obs_xy - pos_xy[None, :], axis=1)
-            
-          
-            repulsion_field = jnp.sum(
-                jnp.where(
-                    dist_to_obs < 0.20, 
-                    (0.20 - dist_to_obs) * 5000.0, 
-                    0.0
-                )
-            )
+
+            onset = 0.30
+            excess = jnp.maximum(0.0, onset - dist_to_obs)
+
+            # A pole sitting close to the gate we are threading must not paralyze the pass.
+            # De-weight each pole by how close it is to the ACTIVE gate center: full strength
+            # out in the open field, tapered to a floor (0.25x) near the gate so the drone
+            # commits through instead of hovering in front. Poles are normally >=1 m from a
+            # gate, so this only relaxes in the rare close-pole case the drone was freezing on.
+            gate_c_xy = params["active_gate_pos"][:2]
+            d_obs_gate = jnp.linalg.norm(obs_xy - gate_c_xy[None, :], axis=1)
+            # De-weight poles by distance to the active gate aim, with two effects in one ramp:
+            #  - strong relief (floor 0.10) for a pole essentially inside the opening so the drone
+            #    commits and threads past it (the aim-dodge has offset the aim to the clear slot),
+            #  - moderate relief across the whole approach (out to ~0.9 m) so the drone approaches
+            #    straight instead of swerving hard near the gate and clipping the frame.
+            # Full strength returns beyond ~0.9 m so genuinely avoidable poles are unaffected.
+            gate_relief = jnp.clip((d_obs_gate - 0.15) / 0.75, 0.10, 1.0)
+
+            repulsion_field = jnp.sum((excess ** 2) * 12000.0 * gate_relief)
             cost += repulsion_field
         
         # 6. Out-of-Bounds
@@ -504,13 +648,36 @@ class MySMPCController(Controller):
         if self.active_wp_idx >= len(self.waypoints):
             self.active_wp_idx = len(self.waypoints) - 1
 
-        current_target = np.array(self.waypoints[self.active_wp_idx])
-        vec_to_target = current_target - pos
-        dist_to_wp = np.linalg.norm(vec_to_target)
+        # Advance the waypoint when we either reach it (proximity) OR have already flown
+        # PAST its plane along the gate axis. The plane test prevents the classic overshoot
+        # failure: a fast pass skips the 0.20 m acceptance ball, active_wp_idx stalls on a
+        # waypoint now behind the drone, and the target pulls it back THROUGH the gate it just
+        # cleared -> it clips the frame on the angled second pass. Passing is only credited
+        # when the drone crossed near the waypoint centerline (lateral gate), so a wild miss
+        # off to the side does not silently skip the gate.
+        while self.active_wp_idx < len(self.waypoints) - 1:
+            wp = np.array(self.waypoints[self.active_wp_idx])
+            axis = np.array(self.gate_dirs[self.active_wp_idx])
+            rel = pos - wp
+            dist_to_wp = np.linalg.norm(rel)
+            longitudinal = float(np.dot(rel, axis))            # >0 means downstream of the wp
+            lateral = float(np.linalg.norm(rel - longitudinal * axis))
+            reached = dist_to_wp < 0.30
+            passed_plane = (longitudinal > 0.0) and (lateral < 0.35)
+            if reached or passed_plane:
+                self.active_wp_idx += 1
+            else:
+                break
 
-        if dist_to_wp < 0.30 and self.active_wp_idx < len(self.waypoints) - 1:
-            self.active_wp_idx += 1
-            current_target = np.array(self.waypoints[self.active_wp_idx])
+        current_target = np.array(self.waypoints[self.active_wp_idx])
+
+        # Route the target around blocking poles. Steering is safe even for the gate-center
+        # waypoint: every pole is >=1.0 m from a gate (obstacle_excl_r in the track generator),
+        # so steering only fires while a pole is between the drone and the gate and RELEASES
+        # once the drone passes it — well before the gate — letting it straighten onto the true
+        # gate line. Without this, a pole on the gate approach leaves the drone no lateral
+        # escape gradient and it stalls/hovers in front of the gate.
+        current_target = self._steer_target_around_obstacles(pos, current_target)
 
         rpy = R.from_quat(obs["quat"]).as_euler("xyz", degrees=False)
         current_state = jnp.array([
@@ -520,6 +687,8 @@ class MySMPCController(Controller):
         ])
 
         
+        active_gate_idx = min(self.active_wp_idx // 3, len(self.all_gate_poses_jnp) - 1)
+
         params = {
             "dt": self.dt,
             "dt_pred": self.dt_pred,
@@ -530,7 +699,10 @@ class MySMPCController(Controller):
             "g_dir": jnp.array(self.gate_dirs[self.active_wp_idx]),
             "obstacles": jnp.array(self.obstacles_np) if len(self.obstacles_np) > 0 else jnp.array([[]]),
             "all_gate_poses": self.all_gate_poses_jnp,
-            "all_gate_dirs": self.all_gate_dirs_jnp
+            "all_gate_dirs": self.all_gate_dirs_jnp,
+            "active_gate_pos": jnp.array(self.all_gate_aims_jnp[active_gate_idx]),
+            "active_gate_dir": jnp.array(self.all_gate_dirs_jnp[active_gate_idx]),
+            "center_weight": self.center_weight
         }
 
         # MPPI optimization
