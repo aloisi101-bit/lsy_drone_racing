@@ -84,7 +84,7 @@ def build_mppi_solver(cost_fn, dynamics_fn):
         if dt_pred is None:
             dt_pred = dt_ctrl
         
-        K = 10000  # Number of parallel trajectories
+        K = 20000  # Number of parallel trajectories
         T = U_nominal.shape[0] # Horizon length in prediction steps
         
         noise = random.normal(rng_key, (K, T, 4)) * noise_std

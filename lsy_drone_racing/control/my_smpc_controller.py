@@ -324,7 +324,7 @@ class MySMPCController(Controller):
         )
         cost += raw_tube_penalty
         
-        cost += jnp.where(longitudinal_dist < 0.0, cross_track_error  * 100.0, 0.0)
+        cost += jnp.where(longitudinal_dist < 0.0, cross_track_error  * 50.0, 0.0)
 
         # 3. GLOBAL STRICT GATE FRAME & STAND PENALTY (True SDF Formulation)
         all_gate_poses = params.get("all_gate_poses")
@@ -410,7 +410,7 @@ class MySMPCController(Controller):
             repulsion_field = jnp.sum(
                 jnp.where(
                     dist_to_obs < 0.15, 
-                    (0.15 - dist_to_obs) * 500.0, 
+                    (0.15 - dist_to_obs) * 1000.0, 
                     0.0
                 )
             )
