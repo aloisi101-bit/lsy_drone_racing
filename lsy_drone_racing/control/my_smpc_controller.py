@@ -110,7 +110,7 @@ class MySMPCController(Controller):
         # Safe clearance radius from an obstacle center (obstacle=0.015m, drone=~0.1m + buffer).
         # This is BOTH the conflict trigger and the distance we push the waypoint out to, so a
         # waypoint is only ever moved outward to the boundary, never pulled inward toward the pole.
-        safe_radius = 0.35
+        safe_radius = 0.25
 
         # Iteratively push away from multiple close obstacles if necessary
         for _ in range(5):
@@ -662,7 +662,7 @@ class MySMPCController(Controller):
             dist_to_wp = np.linalg.norm(rel)
             longitudinal = float(np.dot(rel, axis))            # >0 means downstream of the wp
             lateral = float(np.linalg.norm(rel - longitudinal * axis))
-            reached = dist_to_wp < 0.30
+            reached = dist_to_wp < 0.20
             passed_plane = (longitudinal > 0.0) and (lateral < 0.35)
             if reached or passed_plane:
                 self.active_wp_idx += 1
