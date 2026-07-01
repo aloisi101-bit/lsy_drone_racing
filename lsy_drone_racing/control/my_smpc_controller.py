@@ -72,7 +72,7 @@ class MySMPCController(Controller):
 
         # --- MPPI Configuration ---
         self.H = 10 # Reasonable horizon (0.5s at 50Hz env)
-        self.temperature = 0.08 # Lower temperature for sharper selection of low-cost trajectories
+        self.temperature = 0.1 # Lower temperature for sharper selection of low-cost trajectories
         
         # Noise exploration: [roll, pitch, yaw_rate, thrust]
         self.noise_std = jnp.array([0.15, 0.15, 0.30, 0.1])
@@ -111,7 +111,7 @@ class MySMPCController(Controller):
                 dist = np.linalg.norm(point_xy - obs_xy)
                 
                 # 0.50m is a safe bubble radius (obstacle=0.015m, drone=~0.1m + buffer)
-                if dist < 0.50:
+                if dist < 0.30:
                     conflict = True
                     push_dir = point_xy - obs_xy
                     norm = np.linalg.norm(push_dir)
@@ -124,8 +124,8 @@ class MySMPCController(Controller):
                         norm = np.linalg.norm(push_dir)
                         
                     push_dir = push_dir / norm
-                    # Push waypoint outwards to be exactly 0.23m away from obstacle center
-                    shifted[:2] = obs_xy + push_dir * 0.20
+                    # Push waypoint outwards to be exactly 0.25m away from obstacle center
+                    shifted[:2] = obs_xy + push_dir * 0.25
             
             if not conflict:
                 break
@@ -337,14 +337,14 @@ class MySMPCController(Controller):
         g_dir = params["g_dir"]
         obstacles = params["obstacles"]
 
-        # 1. Positional Attraction Cost
-        # Strong pull to target, heavily weighted in Z to fight Level 3 gravity/downdrafts
+        # 1. Positional Attraction Cost (Soft-Clipped)
         diff = pos - target
         dist_to_target = jnp.linalg.norm(diff)
         xy_dist = jnp.linalg.norm(diff[:2])
         z_dist = jnp.abs(diff[2])
 
-        cost = (xy_dist**2) * 60.0 + (z_dist**2) * 100.0
+        cost = jnp.minimum((xy_dist**2) * 60.0, 500.0) + (xy_dist * 0.0)
+        cost += jnp.minimum((z_dist**2) * 100.0, 500.0) + (z_dist * 0.0)
         
         # 2. Cross-Track Error (Virtual Tube)
         rel_pos = pos - target
@@ -356,12 +356,12 @@ class MySMPCController(Controller):
         
         raw_tube_penalty = jnp.where(
             (cross_track_error > funnel_radius) & (longitudinal_dist < 0.0), 
-            (cross_track_error - funnel_radius) * 50.0, 
+            (cross_track_error - funnel_radius) * 25.0, 
             0.0
         )
         cost += raw_tube_penalty
         
-        cost += jnp.where(longitudinal_dist < 0.0, cross_track_error  * 100.0, 0.0)
+        cost += jnp.where(longitudinal_dist < 0.0, cross_track_error  * 150.0, 0.0)
 
         # 3. GLOBAL STRICT GATE FRAME & STAND PENALTY (True SDF Formulation)
         all_gate_poses = params.get("all_gate_poses")
@@ -406,8 +406,8 @@ class MySMPCController(Controller):
             )
             
             frame_collision = jnp.where(
-                sdf < 0.10,
-                (0.10 - sdf) * 100000.0,
+                sdf < 0.20,
+                (0.20 - sdf) * 10000.0,
                 0.0
             )
             cost += jnp.sum(frame_collision)
@@ -418,7 +418,7 @@ class MySMPCController(Controller):
             
             stand_collision = jnp.where(
                 (depth_below_gate > 0.0) & (dist_to_stand_xy < 0.20),
-                (0.20 - dist_to_stand_xy) * 1000.0 + (depth_below_gate * 500.0),
+                (0.20 - dist_to_stand_xy) * 500.0 + (depth_below_gate * 500.0),
                 0.0
             )
             cost += jnp.sum(stand_collision)
@@ -429,10 +429,10 @@ class MySMPCController(Controller):
         target_dir = -diff / (dist_to_target + 1e-5) 
                
         # Multiply the target_dir penalty by the fade multiplier
-        cost += (1.0 - jnp.dot(vel_dir, target_dir)) * 12.0 * speed 
+        cost += (1.0 - jnp.dot(vel_dir, target_dir)) * 20.0 * speed 
         
         # The g_dir penalty remains fully active to keep the drone pointing forward 
-        cost += (1.0 - jnp.dot(vel_dir, g_dir)) * 8.0 * speed 
+        cost += (1.0 - jnp.dot(vel_dir, g_dir)) * 15.0 * speed 
         
         # Allow the drone to fly fast without huge penalties
         cost += (speed ** 2) * 0.15
@@ -446,8 +446,8 @@ class MySMPCController(Controller):
           
             repulsion_field = jnp.sum(
                 jnp.where(
-                    dist_to_obs < 0.15, 
-                    (0.15 - dist_to_obs) * 500.0, 
+                    dist_to_obs < 0.20, 
+                    (0.20 - dist_to_obs) * 5000.0, 
                     0.0
                 )
             )
@@ -508,7 +508,7 @@ class MySMPCController(Controller):
         vec_to_target = current_target - pos
         dist_to_wp = np.linalg.norm(vec_to_target)
 
-        if dist_to_wp < 0.20 and self.active_wp_idx < len(self.waypoints) - 1:
+        if dist_to_wp < 0.30 and self.active_wp_idx < len(self.waypoints) - 1:
             self.active_wp_idx += 1
             current_target = np.array(self.waypoints[self.active_wp_idx])
 
