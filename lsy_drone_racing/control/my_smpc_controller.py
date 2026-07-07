@@ -69,7 +69,7 @@ class MySMPCController(Controller):
 
         # MPPI configuration.
         self._horizon = 20  # prediction steps (~0.4 s at the prediction step)
-        self.temperature = 0.08  # softmax temperature; lower = sharper trajectory selection
+        self.temperature = 0.50  # softmax temperature; lower = sharper trajectory selection
         # Per-action exploration std. Yaw is a small angle offset (it was a rate before, so
         # the old 0.30 now perturbs the predicted heading ~25x more and must be scaled down).
         self.noise_std = jnp.array([0.15, 0.15, 0.02, 0.1])
