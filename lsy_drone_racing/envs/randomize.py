@@ -126,26 +126,15 @@ def build_random_track_fn(
     *,
     border_margin: float = 0.5,
     drone_excl_r: float = 1.0,
-    drone_excl_r: float = 1.0,
     gate_excl_r: float = 1.0,
-    obstacle_excl_r: float = 0.8,
-    obstacle_obstacle_excl_r: float = 0.3,
-    obstacle_corridor_width: float = 0.5,
     obstacle_excl_r: float = 0.8,
     obstacle_obstacle_excl_r: float = 0.3,
     obstacle_corridor_width: float = 0.5,
     yaw_range: float = 0.75,
     grid_res: int = 40,
 ) -> Callable[[Array, Array], tuple[Array, Array, Array]]:
-    grid_res: int = 40,
-) -> Callable[[Array, Array], tuple[Array, Array, Array]]:
     """Build a JIT- and vmap-compatible function that generates a complete random track layout.
 
-    The track is built around a given drone start position. Gates and obstacles are placed one after
-    another on a static 2-D grid. Each object type keeps a running per-cell clearance field (signed
-    distance to the nearest placed object minus its radius) and samples a cell that still keeps
-    every exclusion radius. If the grid saturates, the least-violating cell is used. Gate and
-    obstacle heights are fixed at the values provided.
     The track is built around a given drone start position. Gates and obstacles are placed one after
     another on a static 2-D grid. Each object type keeps a running per-cell clearance field (signed
     distance to the nearest placed object minus its radius) and samples a cell that still keeps
@@ -159,22 +148,15 @@ def build_random_track_fn(
         pos_limit_high: XY upper bounds of the arena ``[xmax, ymax]``.
         border_margin: Min distance [m] of all objects from the arena boundary.
         drone_excl_r: Min distance [m] of gates and obstacles from the drone start position.
-        drone_excl_r: Min distance [m] of gates and obstacles from the drone start position.
         gate_excl_r: Min distance [m] between consecutive gates.
-        obstacle_excl_r: Min distance [m] from gates to obstacles.
-        obstacle_obstacle_excl_r: Min distance [m] between obstacles.
         obstacle_excl_r: Min distance [m] from gates to obstacles.
         obstacle_obstacle_excl_r: Min distance [m] between obstacles.
         obstacle_corridor_width: Half-width [m] of the corridor used for obstacle placement.
         yaw_range: Maximum yaw offset [rad] from the travel direction for gate orientation.
         grid_res: Number of grid nodes along the x-axis. The y-axis count is derived from the arena
             aspect ratio so the grid spacing is equal in both axes (square cells).
-        grid_res: Number of grid nodes along the x-axis. The y-axis count is derived from the arena
-            aspect ratio so the grid spacing is equal in both axes (square cells).
 
     Returns:
-        ``sample_track(drone_pos, key) -> (gates_pos, gates_quat, obstacles_pos)``, a pure JAX
-        function that produces one random track per call.
         ``sample_track(drone_pos, key) -> (gates_pos, gates_quat, obstacles_pos)``, a pure JAX
         function that produces one random track per call.
     """
@@ -185,11 +167,6 @@ def build_random_track_fn(
 
     xmin, ymin = jp.array(pos_limit_low[:2], dtype=jp.float32) + border_margin
     xmax, ymax = jp.array(pos_limit_high[:2], dtype=jp.float32) - border_margin
-
-    width = float(pos_limit_high[0] - pos_limit_low[0]) - 2 * border_margin
-    height = float(pos_limit_high[1] - pos_limit_low[1]) - 2 * border_margin
-    grid_w = grid_res
-    grid_h = max(1, round(grid_res * height / width))
 
     width = float(pos_limit_high[0] - pos_limit_low[0]) - 2 * border_margin
     height = float(pos_limit_high[1] - pos_limit_low[1]) - 2 * border_margin
@@ -219,32 +196,6 @@ def build_random_track_fn(
         weight = jp.where(weight.sum() > 0, weight, best)
         return grid_flat[jax.random.choice(key, weight.shape[0], p=weight / weight.sum())]
 
-    def _sample(clearance: Array, preference: Array, key: Array) -> Array:
-        """Sample a grid cell.
-
-        Args:
-            clearance: The signed margin to every placed object.
-            preference: A soft 0/1 mask marking where the cell would ideally lie.
-            key: JAX PRNG key.
-        """
-        valid = (clearance > 0).reshape(-1).astype(jp.float32)
-        preferred = valid * preference.reshape(-1)
-        # Case 1: cells that keep every exclusion radius *and* lie in the soft preference region.
-        # Case 2: preference leaves nothing -> any cell that still keeps every exclusion radius.
-        weight = jp.where(preferred.sum() > 0, preferred, valid)
-        # Case 3: grid saturated, no cell keeps all radii -> the single least-violating cell.
-        best = (jp.arange(valid.size) == jp.argmax(clearance)).astype(jp.float32)
-        weight = jp.where(weight.sum() > 0, weight, best)
-        return grid_flat[jax.random.choice(key, weight.shape[0], p=weight / weight.sum())]
-
-    def _clearance(center: Array, radius: float) -> Array:
-        """Calculate the signed clearance per cell.
-
-        Args:
-            center: The XY position of the object.
-            radius: The exclusion radius of the object.
-        """
-        return jp.sqrt(jp.sum((grid - center) ** 2, axis=-1)) - radius
     def _clearance(center: Array, radius: float) -> Array:
         """Calculate the signed clearance per cell.
 
@@ -256,27 +207,20 @@ def build_random_track_fn(
 
     def _corridor(from_xy: Array, to_xy: Array, width: float) -> Array:
         """Create a grid mask for cells within `width` of the segment `from_xy -> to_xy`."""
-        """Create a grid mask for cells within `width` of the segment `from_xy -> to_xy`."""
         v = to_xy - from_xy
         n = jp.linalg.norm(v) + 1e-8
-        proj = jp.sum((grid - from_xy) * (v / n), axis=-1)
-        perp = jp.linalg.norm(grid - (from_xy + proj[..., None] * v / n), axis=-1)
         proj = jp.sum((grid - from_xy) * (v / n), axis=-1)
         perp = jp.linalg.norm(grid - (from_xy + proj[..., None] * v / n), axis=-1)
         return ((perp < width) & (proj >= 0) & (proj <= n)).astype(jp.float32)
 
     def sample_track(drone_pos: Array, key: Array) -> tuple[Array, Array, Array]:
         """Sample one random track around the given drone start position.
-    def sample_track(drone_pos: Array, key: Array) -> tuple[Array, Array, Array]:
-        """Sample one random track around the given drone start position.
 
         Args:
-            drone_pos: Drone start position ``(3,)``.
             drone_pos: Drone start position ``(3,)``.
             key: JAX PRNG key.
 
         Returns:
-            ``(gates_pos (N, 3), gates_quat (N, 4), obstacles_pos (N, 3))``.
             ``(gates_pos (N, 3), gates_quat (N, 4), obstacles_pos (N, 3))``.
         """
         keys = jax.random.split(key, 3 * N)
@@ -307,12 +251,9 @@ def build_random_track_fn(
         half_yaw = gates[:, 2] / 2.0
         zeros = jp.zeros_like(half_yaw)
         gates_quat = jp.stack([zeros, zeros, jp.sin(half_yaw), jp.cos(half_yaw)], axis=-1)
-        zeros = jp.zeros_like(half_yaw)
-        gates_quat = jp.stack([zeros, zeros, jp.sin(half_yaw), jp.cos(half_yaw)], axis=-1)
         obstacles_pos = jp.concatenate([obstacles, obstacles_z[:, None]], axis=-1)
         return gates_pos, gates_quat, obstacles_pos
 
-    return sample_track
     return sample_track
 
 
@@ -337,8 +278,6 @@ def build_full_track_randomization_fn(
     def randomize_track(data: EnvData, mask: Array, key: Array) -> EnvData:
         n_envs = data.gates_pos.shape[0]
         keys = jax.random.split(key, n_envs)
-        drones_pos = data.sim_data.states.pos[:, 0]  # build each track around the first drone
-        gates_pos, gates_quat, obstacles_pos = batched_generate(drones_pos, keys)
         drones_pos = data.sim_data.states.pos[:, 0]  # build each track around the first drone
         gates_pos, gates_quat, obstacles_pos = batched_generate(drones_pos, keys)
         return leaf_replace(
