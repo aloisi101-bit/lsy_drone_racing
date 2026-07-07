@@ -261,7 +261,7 @@ class MySMPCController(Controller):
         z_dist = jnp.abs(diff[2])
 
         # 1. Attraction to the target waypoint (Z weighted harder to hold altitude).
-        cost = xy_dist**2 * 100.0 + z_dist**2 * 150.0
+        cost = xy_dist**2 * 125.0 + z_dist**2 * 150.0
 
         # 2. Cross-track "tube": penalize lateral deviation while approaching the gate.
         longitudinal_dist = jnp.dot(diff, gate_dir)
@@ -322,7 +322,7 @@ class MySMPCController(Controller):
         target_dir = -diff / (dist_to_target + 1e-5)
         cost += (1.0 - jnp.dot(vel_dir, target_dir)) * 20.0 * speed
         cost += (1.0 - jnp.dot(vel_dir, gate_dir)) * 10.0 * speed
-        cost += speed**2 * 0.15
+        cost += speed**2 * 0.05
 
         # 5. Obstacle repulsion (cylindrical, XY only).
         if obstacles.shape[0] > 0:
