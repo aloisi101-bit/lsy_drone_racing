@@ -218,7 +218,6 @@ def build_random_track_fn(
             (2,),
             minval=jp.array([xmin - border_margin, ymin - border_margin]),
             maxval=jp.array([xmax + border_margin, ymax + border_margin]),
-
         )
         start_excl = _excl_circle(start_xy, start_excl_r)
 
@@ -240,7 +239,10 @@ def build_random_track_fn(
             # Place gate
             gate_xy = _sample(gate_w * gate_excl, k_gates[i])
             prev_xy = jax.lax.cond(
-                i == 0, lambda _: start_xy.astype(jp.float32), lambda _: gates[i - 1, :2], operand=None
+                i == 0,
+                lambda _: start_xy.astype(jp.float32),
+                lambda _: gates[i - 1, :2],
+                operand=None,
             )
             travel_dir = gate_xy - prev_xy
             yaw_offset = jax.random.uniform(k_yaws[i], minval=-yaw_range, maxval=yaw_range)

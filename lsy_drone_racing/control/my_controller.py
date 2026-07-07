@@ -1,4 +1,5 @@
 """Module for the custom drone controller."""
+
 from __future__ import annotations  # Python 3.10 type hints
 
 import math
@@ -26,10 +27,9 @@ class MyController(Controller):
         drone_params = load_params(config.sim.physics, config.sim.drone_model)
         self.drone_mass = drone_params["mass"]
 
-
         self.kp = np.array([0.8, 0.8, 1.5])
         self.kd = np.array([0.4, 0.4, 0.6])
-        self.ki = np.array([0.25, 0.25, 0.4]) 
+        self.ki = np.array([0.25, 0.25, 0.4])
         self.ki_range = np.array([4.0, 4.0, 2.5])
         self.i_error = np.zeros(3)
         self.g = 9.81
@@ -38,7 +38,7 @@ class MyController(Controller):
         # --- DYNAMIC TRAJECTORY GENERATION ---
         self.nominal_gates = [np.array(g["pos"]) for g in config.env.track.gates]
         self.nominal_obstacles = [np.array(o["pos"]) for o in config.env.track.obstacles]
-        
+
         # Track which gates we have already updated our trajectory for
         self.gates_discovered = np.zeros(len(self.nominal_gates), dtype=bool)
         self.obstacles_discovered = np.zeros(len(self.nominal_obstacles), dtype=bool)
@@ -47,7 +47,7 @@ class MyController(Controller):
 
         # Generate initial trajectory guess
         self._update_trajectory(obs["pos"], self.nominal_gates, self.nominal_obstacles)
-        
+
         self._tick = 0
         self._finished = False
 
@@ -61,41 +61,41 @@ class MyController(Controller):
         R_DRONE = 0.10
         R_OBS = 0.03 / 2.0
         GATE_HALF_WIDTH = 0.4 / 2
-        
+
         MARGIN = 0.10
-        SAFE_RADIUS = R_DRONE + R_OBS + MARGIN 
-        MAX_GATE_SHIFT = GATE_HALF_WIDTH - R_DRONE - 0.02 
-        GATE_DEPTH = 0.5      
-        
+        SAFE_RADIUS = R_DRONE + R_OBS + MARGIN
+        MAX_GATE_SHIFT = GATE_HALF_WIDTH - R_DRONE - 0.02
+        GATE_DEPTH = 0.5
+
         waypoints_list = [current_pos]
         takeoff_pos = current_pos.copy()
         takeoff_pos[2] += 0.35
         waypoints_list.append(takeoff_pos)
-        
+
         for i, gate_pos in enumerate(target_gates):
             prev_pos = waypoints_list[-1]
             path_len_2d = np.linalg.norm(gate_pos[0:2] - prev_pos[0:2])
-            
+
             if path_len_2d < 1e-4:
-                continue 
+                continue
 
             direction = (gate_pos - prev_pos) / np.linalg.norm(gate_pos - prev_pos)
             right_shift = np.array([direction[1], -direction[0], 0.0])
-            
+
             # --- PHASE 1: THE APPROACH DODGE ---
             for obs_pos in target_obstacles:
                 dist_to_gate = np.linalg.norm(gate_pos[0:2] - obs_pos[0:2])
                 dist_from_prev = np.linalg.norm(obs_pos[0:2] - prev_pos[0:2])
                 stretch_threshold = np.sqrt(path_len_2d**2 + 4 * (SAFE_RADIUS**2)) - path_len_2d
-                
+
                 if (dist_to_gate + dist_from_prev) < (path_len_2d + stretch_threshold):
                     detour_pos = obs_pos.copy()
-                    detour_pos[2] = gate_pos[2] 
-                    detour_pos += right_shift * SAFE_RADIUS 
+                    detour_pos[2] = gate_pos[2]
+                    detour_pos += right_shift * SAFE_RADIUS
                     detour_pos -= direction * 0.2
                     waypoints_list.append(detour_pos)
-                    break 
-            
+                    break
+
             # --- PHASE 2: ADD GATE ---
             waypoints_list.append(gate_pos)
 
@@ -104,65 +104,64 @@ class MyController(Controller):
             post_dodge_pos = None
             blocking_obs_dist = None
             closest_obs_pos = None
-            
+
             # Step 1: Scan for the closest blocking obstacle behind the gate
             for obs_pos in target_obstacles:
                 obs_dir = obs_pos[0:2] - gate_pos[0:2]
                 forward_dist = np.dot(obs_dir, direction[0:2])
-                
+
                 # Check if it is within 1.5m in front of us
                 if 0 < forward_dist < 2.0:
                     lateral_dist = np.linalg.norm(obs_dir - forward_dist * direction[0:2])
-                    
+
                     # If it is in our flight path
                     if lateral_dist < SAFE_RADIUS:
                         if blocking_obs_dist is None or forward_dist < blocking_obs_dist:
                             blocking_obs_dist = forward_dist
                             closest_obs_pos = obs_pos
-                            
+
             # Step 2: Calculate variable GATE_DEPTH
             if blocking_obs_dist is not None:
-                # Scale depth to 50% of the distance to the obstacle, 
+                # Scale depth to 50% of the distance to the obstacle,
                 # but never less than 0.15m (to clear the gate frame)
-                GATE_DEPTH = min(0.2, blocking_obs_dist *0.5)
+                GATE_DEPTH = min(0.2, blocking_obs_dist * 0.5)
             else:
                 # If the track is clear, use a smooth 0.8m straight exit
                 GATE_DEPTH = 0.7
-                
+
             # Step 3: Create the waypoints
             phantom_pos = gate_pos + (direction * GATE_DEPTH)
             post_dodge_pos = None
-            
+
             if blocking_obs_dist is not None:
                 # Determine which way to shift
-                cross_p = (
-                    direction[0] * (closest_obs_pos[1] - gate_pos[1])
-                    - direction[1] * (closest_obs_pos[0] - gate_pos[0])
+                cross_p = direction[0] * (closest_obs_pos[1] - gate_pos[1]) - direction[1] * (
+                    closest_obs_pos[0] - gate_pos[0]
                 )
                 shift_dir = right_shift if cross_p > 0 else -right_shift
-                
+
                 # Stage 1: Shift the phantom position slightly to start the dodge
                 phantom_pos += shift_dir * min(SAFE_RADIUS, MAX_GATE_SHIFT)
-                
+
                 # Stage 2: Full sweep placed perfectly parallel to the obstacle
                 post_dodge_pos = closest_obs_pos.copy()
                 post_dodge_pos[2] = gate_pos[2]
                 post_dodge_pos += shift_dir * (SAFE_RADIUS * 2.5)
                 post_dodge_pos += direction * 0.4
-            
+
             # Append waypoints
             phantom_pos[2] = gate_pos[2]
             waypoints_list.append(phantom_pos)
-            
+
             if post_dodge_pos is not None:
                 waypoints_list.append(post_dodge_pos)
-            
+
         waypoints = np.array(waypoints_list)
-        
+
         diffs = np.diff(waypoints, axis=0)
         distances = np.linalg.norm(diffs, axis=1)
         cum_dist = np.insert(np.cumsum(distances), 0, 0.0)
-        
+
         if cum_dist[-1] > 0:
             t = (cum_dist / cum_dist[-1]) * self._t_total
         else:
@@ -186,24 +185,24 @@ class MyController(Controller):
             current_known_gates = []
             for i in range(len(self.nominal_gates)):
                 if visited_mask_gates[i]:
-                    current_known_gates.append(obs["gates_pos"][i]) # True pos
+                    current_known_gates.append(obs["gates_pos"][i])  # True pos
                 else:
-                    current_known_gates.append(self.nominal_gates[i]) # Still guessing
-            
+                    current_known_gates.append(self.nominal_gates[i])  # Still guessing
+
             current_known_obstacles = []
             for i in range(len(self.nominal_obstacles)):
                 if visited_mask_obstacles[i]:
-                    current_known_obstacles.append(obs["obstacles_pos"][i]) # True pos
+                    current_known_obstacles.append(obs["obstacles_pos"][i])  # True pos
                 else:
-                    current_known_obstacles.append(self.nominal_obstacles[i]) # Still guessing
-            
+                    current_known_obstacles.append(self.nominal_obstacles[i])  # Still guessing
+
             # Re-calculate the CubicSpline trajectory using the new information
             self._update_trajectory(self.spawn_pos, current_known_gates, current_known_obstacles)
             self.gates_discovered = visited_mask_gates.copy()
             self.obstacles_discovered = visited_mask_obstacles.copy()
 
         t = min(self._tick / self._freq, self._t_total)
-        
+
         if t >= self._t_total:  # Maximum duration reached
             self._finished = True
 

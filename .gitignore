@@ -18,6 +18,7 @@ c_generated_code/
 .pixi/*
 !.pixi/config.toml
 ros_ws/
+acados/
 acados/lsy_drone_racing/control/mppi_dynamics.py
 lsy_drone_racing/control/mppi_cost.py
 lsy_drone_racing/control/mppi_collision.py
