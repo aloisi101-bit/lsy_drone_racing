@@ -66,11 +66,10 @@ class MySMPCController(Controller):
             self.init_gates_pos, self.init_gates_rpy, self.obstacle_positions
         )
         self.waypoint_idx = 0
-
         # MPPI configuration.
         self._horizon = 20  # prediction steps (~0.4 s at the prediction step)
         self.temperature = 0.50  # softmax temperature; lower = sharper trajectory selection
-        # Per-action exploration noise standard deviation: roll, pitch, yaw, thrust. 
+        # Per-action exploration noise standard deviation: roll, pitch, yaw, thrust.
         self.noise_std = jnp.array([0.15, 0.15, 0.02, 0.1])
         self.engine = build_mppi_solver(self._cost_fn, self._dynamics_fn)
         self.nominal_actions = self._initial_nominal_actions()
