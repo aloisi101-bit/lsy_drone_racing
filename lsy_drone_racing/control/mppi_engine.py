@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 # Force 64-bit precision so the softmax over trajectory costs does not overflow.
 jax.config.update("jax_enable_x64", True)
 
-NUM_SAMPLES = 10000  # parallel noisy action sequences sampled per solver step
+NUM_SAMPLES = 20000  # parallel noisy action sequences sampled per solver step
 TERMINAL_COST_WEIGHT = 5.0  # extra weight on the final-state cost of each rollout
 
 

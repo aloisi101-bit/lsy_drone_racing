@@ -89,7 +89,7 @@ class MySMPCController(Controller):
     def _initial_nominal_actions(self) -> jax.Array:
         """Return the warm-start action sequence: slight forward tilt and a lift bias."""
         nominal = jnp.zeros((self._horizon, 4))
-        nominal = nominal.at[:, 0].set(0.01)  # gentle forward pitch
+        nominal = nominal.at[:, 0].set(0.1)  # gentle forward pitch
         nominal = nominal.at[:, 3].set(self.hover_thrust * 1.5)  # extra lift on cold start
         return nominal
 
@@ -261,7 +261,7 @@ class MySMPCController(Controller):
         z_dist = jnp.abs(diff[2])
 
         # 1. Attraction to the target waypoint (Z weighted harder to hold altitude).
-        cost = xy_dist**2 * 60.0 + z_dist**2 * 100.0
+        cost = xy_dist**2 * 100.0 + z_dist**2 * 150.0
 
         # 2. Cross-track "tube": penalize lateral deviation while approaching the gate.
         longitudinal_dist = jnp.dot(diff, gate_dir)
@@ -269,7 +269,7 @@ class MySMPCController(Controller):
         funnel_radius = 0.10 + jnp.maximum(0.0, -longitudinal_dist)
         cost += jnp.where(
             (cross_track_error > funnel_radius) & (longitudinal_dist < 0.0),
-            (cross_track_error - funnel_radius) * 50.0,
+            (cross_track_error - funnel_radius) * 200.0,
             0.0,
         )
         cost += jnp.where(longitudinal_dist < 0.0, cross_track_error * 50.0, 0.0)
@@ -320,14 +320,14 @@ class MySMPCController(Controller):
         speed = jnp.linalg.norm(vel) + 1e-5
         vel_dir = vel / speed
         target_dir = -diff / (dist_to_target + 1e-5)
-        cost += (1.0 - jnp.dot(vel_dir, target_dir)) * 12.0 * speed
-        cost += (1.0 - jnp.dot(vel_dir, gate_dir)) * 8.0 * speed
+        cost += (1.0 - jnp.dot(vel_dir, target_dir)) * 20.0 * speed
+        cost += (1.0 - jnp.dot(vel_dir, gate_dir)) * 10.0 * speed
         cost += speed**2 * 0.15
 
         # 5. Obstacle repulsion (cylindrical, XY only).
         if obstacles.shape[0] > 0:
             dist_to_obs = jnp.linalg.norm(obstacles[:, :2] - pos[:2][None, :], axis=1)
-            cost += jnp.sum(jnp.where(dist_to_obs < 0.15, (0.15 - dist_to_obs) * 1000.0, 0.0))
+            cost += jnp.sum(jnp.where(dist_to_obs < 0.20, (0.20 - dist_to_obs) * 10000.0, 0.0))
 
         # 6. Keep the drone inside the arena bounds.
         out_of_bounds = (
